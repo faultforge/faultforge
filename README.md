@@ -5,12 +5,19 @@ FaultForge is a modern chaos engineering platform that helps you discover weakne
 
 ## ✨ Key Features:
 🎯 Master-Agent Architecture - Scalable orchestration across distributed environments
+
 🔌 Plugin-Based Chaos - Extensible failure injection (CPU, memory, network, disk, custom)
+
 📝 Declarative DSL - Define complex scenarios in simple YAML
+
 🖥️ Multiple Interfaces - Web GUI, Terminal UI, and REST API
+
 🔐 Enterprise Security - mTLS encryption and token-based authentication
+
 📊 Rich Observability - Real-time metrics and comprehensive reporting
+
 🐳 Cloud Native - Docker/Kubernetes ready with Helm charts
+
 
 ## 🌟 Use Cases:
 - Pre-production Testing - Validate system resilience before deployment
