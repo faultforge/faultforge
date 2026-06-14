@@ -1,0 +1,1790 @@
+# FaultForge MVP Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the FaultForge master + agent so agents register over a persistent bidi gRPC stream, stay connected via heartbeats, and show up Connected/Stale/Disconnected on the master (REST + CLI). No fault injection.
+
+**Architecture:** A Cargo workspace with four crates. `proto` holds the shared gRPC contract. The `master` runs a tonic gRPC server (the `Connect` bidi stream), an axum REST API, an in-memory connection registry, a SQLite-backed `AgentStore`, and a staleness sweep. The `agent` dials the master, registers, heartbeats, and reconnects with backoff. The `cli` talks to the REST API.
+
+**Tech Stack:** Rust, tokio, tonic + prost (gRPC), sqlx (SQLite), axum (REST), reqwest (CLI), clap, uuid, anyhow/thiserror, tracing, async-trait.
+
+---
+
+## File Structure
+
+```
+faultforge/
+├── Cargo.toml                          # [workspace] members
+├── crates/
+│   ├── proto/
+│   │   ├── Cargo.toml
+│   │   ├── build.rs                    # tonic-build codegen
+│   │   ├── proto/faultforge.proto      # the contract
+│   │   └── src/lib.rs                  # include_proto! + now_unix_ms() helper
+│   ├── master/
+│   │   ├── Cargo.toml
+│   │   ├── migrations/0001_init.sql    # agents table
+│   │   └── src/
+│   │       ├── main.rs                 # config + wiring + server startup
+│   │       ├── config.rs               # MasterConfig (clap + env)
+│   │       ├── store/mod.rs            # AgentStore trait, AgentRecord, RegisterInfo
+│   │       ├── store/sqlite.rs         # SqliteStore impl (+ reseed-only rule)
+│   │       ├── registry.rs            # in-memory ConnectionRegistry + AgentStatus
+│   │       ├── grpc.rs                 # AgentService::connect bidi handler
+│   │       ├── sweep.rs                # background staleness/dead sweep
+│   │       └── rest.rs                 # axum router + handlers + AgentView
+│   ├── agent/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs                 # config + run loop
+│   │       ├── config.rs               # AgentConfig (clap + env)
+│   │       ├── state.rs                # local agent_id persistence
+│   │       └── client.rs               # dial + register + heartbeat + backoff
+│   └── cli/
+│       ├── Cargo.toml
+│       └── src/main.rs                 # `faultforge agents ...` over REST
+└── docs/superpowers/specs/2026-06-14-faultforge-mvp-design.md   # the spec
+```
+
+**Status is computed, not stored.** Given the in-memory `last_seen` and registry presence:
+- not in registry → `Disconnected`
+- in registry, `now - last_seen <= stale_after` → `Connected`
+- in registry, `now - last_seen > stale_after` → `Stale`
+
+`stale_after = heartbeat_interval * stale_multiplier` (default multiplier 3). The sweep cancels+removes a handle once `now - last_seen > stale_after * 2` (the "dead"/zombie cutoff), turning Stale → Disconnected and persisting `last_seen`.
+
+---
+
+## Task 0: Workspace + proto crate
+
+**Files:**
+- Create: `Cargo.toml`, `crates/proto/Cargo.toml`, `crates/proto/build.rs`, `crates/proto/proto/faultforge.proto`, `crates/proto/src/lib.rs`
+
+- [ ] **Step 1: Create the workspace manifest**
+
+Create `Cargo.toml`:
+
+```toml
+[workspace]
+resolver = "2"
+members = ["crates/proto", "crates/master", "crates/agent", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+```
+
+> Versions are a floor; if `cargo build` reports a newer compatible release, prefer `cargo add` to resolve. Keep tonic/prost/tonic-build on the **same** minor.
+
+- [ ] **Step 2: Create the proto crate manifest**
+
+Create `crates/proto/Cargo.toml`:
+
+```toml
+[package]
+name = "faultforge-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+```
+
+- [ ] **Step 3: Write the contract**
+
+Create `crates/proto/proto/faultforge.proto`:
+
+```proto
+syntax = "proto3";
+package faultforge.v1;
+
+// One long-lived bidi stream: agent dials in, master pushes down.
+service AgentService {
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+message AgentMessage {
+  oneof payload {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message Register {
+  string agent_id = 1;   // stable UUID, self-generated by the agent
+  string name = 2;       // hostname default; seeds master record on first registration
+  string hostname = 3;
+  string os = 4;
+  string arch = 5;
+  string version = 6;
+}
+
+message Heartbeat {}
+
+message ServerMessage {
+  oneof payload {
+    RegisterAck register_ack = 1;
+    // reserved for the next slice: Command command = 2;
+  }
+}
+
+message RegisterAck {
+  int64 server_time_unix_ms = 1;
+  uint32 heartbeat_interval_secs = 2;
+}
+```
+
+- [ ] **Step 4: Wire codegen**
+
+Create `crates/proto/build.rs`:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_build::compile_protos("proto/faultforge.proto")?;
+    Ok(())
+}
+```
+
+Create `crates/proto/src/lib.rs`:
+
+```rust
+pub mod v1 {
+    tonic::include_proto!("faultforge.v1");
+}
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+pub fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis() as i64
+}
+```
+
+- [ ] **Step 5: Build & verify codegen**
+
+Run: `cargo build -p faultforge-proto`
+Expected: PASS (compiles, generates `faultforge.v1` types). Requires `protoc` available, or rely on tonic-build's vendored `protoc` — if build fails with "protoc not found", install protobuf (`brew install protobuf`).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add Cargo.toml crates/proto
+git commit -m "feat(proto): workspace + gRPC AgentService contract"
+```
+
+---
+
+## Task 1: Master store trait & types
+
+**Files:**
+- Create: `crates/master/Cargo.toml`, `crates/master/src/store/mod.rs`
+- Create stub: `crates/master/src/main.rs` (temporary, so the crate builds)
+
+- [ ] **Step 1: Master crate manifest**
+
+Create `crates/master/Cargo.toml`:
+
+```toml
+[package]
+name = "faultforge-master"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "faultforge-master"
+path = "src/main.rs"
+
+[dependencies]
+faultforge-proto = { path = "../proto" }
+tokio.workspace = true
+tonic.workspace = true
+prost.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+dashmap = "6"
+tokio-util = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+```
+
+- [ ] **Step 2: Define the store trait & types**
+
+Create `crates/master/src/store/mod.rs` (the `sqlite` submodule is added in Task 2, when the file exists):
+
+```rust
+use async_trait::async_trait;
+
+/// Durable view of a registered agent (the SQLite tier).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRecord {
+    pub agent_id: String,
+    pub name: String,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub version: String,
+    pub last_seen_unix_ms: i64,
+}
+
+/// Data carried by a `Register` frame, used to upsert the durable record.
+#[derive(Clone, Debug)]
+pub struct RegisterInfo {
+    pub agent_id: String,
+    pub name: String,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub version: String,
+    pub last_seen_unix_ms: i64,
+}
+
+/// Durable storage for agent identity. Covers ONLY the persistent tier;
+/// live-connection state lives in the in-memory registry.
+#[async_trait]
+pub trait AgentStore: Send + Sync + 'static {
+    /// Insert on first registration (seeding `name`); on an existing
+    /// `agent_id`, update everything EXCEPT `name` (master is authoritative
+    /// for name after first registration). Returns the resulting record.
+    async fn upsert_on_register(&self, info: RegisterInfo) -> anyhow::Result<AgentRecord>;
+    async fn get(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>>;
+    async fn list(&self) -> anyhow::Result<Vec<AgentRecord>>;
+    /// Returns false if no such agent.
+    async fn set_name(&self, agent_id: &str, name: &str) -> anyhow::Result<bool>;
+    async fn update_last_seen(&self, agent_id: &str, ts_ms: i64) -> anyhow::Result<()>;
+    /// Returns false if no such agent.
+    async fn delete(&self, agent_id: &str) -> anyhow::Result<bool>;
+}
+```
+
+- [ ] **Step 3: Temporary main stub so the crate compiles**
+
+Create `crates/master/src/main.rs`:
+
+```rust
+mod store;
+
+fn main() {
+    println!("faultforge-master (stub)");
+}
+```
+
+- [ ] **Step 4: Build**
+
+Run: `cargo build -p faultforge-master`
+Expected: PASS (warnings about unused trait are fine).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/master
+git commit -m "feat(master): AgentStore trait and record types"
+```
+
+---
+
+## Task 2: SQLite store implementation
+
+**Files:**
+- Create: `crates/master/migrations/0001_init.sql`, `crates/master/src/store/sqlite.rs`
+
+- [ ] **Step 0: Declare the submodule**
+
+Add this line to the top of `crates/master/src/store/mod.rs`:
+
+```rust
+pub mod sqlite;
+```
+
+- [ ] **Step 1: Migration**
+
+Create `crates/master/migrations/0001_init.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id          TEXT    PRIMARY KEY,
+    name              TEXT    NOT NULL,
+    hostname          TEXT    NOT NULL,
+    os                TEXT    NOT NULL,
+    arch              TEXT    NOT NULL,
+    version           TEXT    NOT NULL,
+    last_seen_unix_ms INTEGER NOT NULL
+);
+```
+
+- [ ] **Step 2: Write the failing test (reseed-only-on-first rule)**
+
+Add to the bottom of `crates/master/src/store/sqlite.rs` (create the file with this test first; the impl comes next):
+
+```rust
+//! SQLite-backed AgentStore.
+
+use crate::store::{AgentRecord, AgentStore, RegisterInfo};
+use async_trait::async_trait;
+use sqlx::sqlite::{SqlitePoolOptions, SqliteConnectOptions};
+use sqlx::SqlitePool;
+use std::str::FromStr;
+
+#[derive(Clone)]
+pub struct SqliteStore {
+    pool: SqlitePool,
+}
+
+impl SqliteStore {
+    /// Open (creating if missing) and run migrations.
+    pub async fn connect(db_url: &str) -> anyhow::Result<Self> {
+        let opts = SqliteConnectOptions::from_str(db_url)?.create_if_missing(true);
+        let pool = SqlitePoolOptions::new().max_connections(5).connect_with(opts).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Self { pool })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(id: &str, name: &str, ver: &str, ts: i64) -> RegisterInfo {
+        RegisterInfo {
+            agent_id: id.into(), name: name.into(), hostname: "h".into(),
+            os: "linux".into(), arch: "x86_64".into(), version: ver.into(),
+            last_seen_unix_ms: ts,
+        }
+    }
+
+    async fn store() -> SqliteStore {
+        SqliteStore::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_registration_seeds_name() {
+        let s = store().await;
+        let rec = s.upsert_on_register(info("a1", "web-01", "0.1.0", 100)).await.unwrap();
+        assert_eq!(rec.name, "web-01");
+        assert_eq!(rec.last_seen_unix_ms, 100);
+    }
+
+    #[tokio::test]
+    async fn reregistration_keeps_master_name_but_updates_rest() {
+        let s = store().await;
+        s.upsert_on_register(info("a1", "host-default", "0.1.0", 100)).await.unwrap();
+        s.set_name("a1", "renamed-by-admin").await.unwrap();
+        // Agent reconnects, reporting its hostname-derived name again + new version/ts.
+        let rec = s.upsert_on_register(info("a1", "host-default", "0.2.0", 200)).await.unwrap();
+        assert_eq!(rec.name, "renamed-by-admin", "name must NOT be reseeded");
+        assert_eq!(rec.version, "0.2.0");
+        assert_eq!(rec.last_seen_unix_ms, 200);
+    }
+
+    #[tokio::test]
+    async fn set_name_and_delete_report_missing() {
+        let s = store().await;
+        assert!(!s.set_name("nope", "x").await.unwrap());
+        assert!(!s.delete("nope").await.unwrap());
+        s.upsert_on_register(info("a1", "n", "0.1.0", 1)).await.unwrap();
+        assert!(s.set_name("a1", "x").await.unwrap());
+        assert!(s.delete("a1").await.unwrap());
+        assert!(s.get("a1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_returns_all() {
+        let s = store().await;
+        s.upsert_on_register(info("a1", "n1", "0.1.0", 1)).await.unwrap();
+        s.upsert_on_register(info("a2", "n2", "0.1.0", 1)).await.unwrap();
+        assert_eq!(s.list().await.unwrap().len(), 2);
+    }
+}
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `cargo test -p faultforge-master --lib store::sqlite`
+Expected: FAIL — `upsert_on_register`/`get`/`list`/`set_name`/`delete` not implemented (trait not impl'd for `SqliteStore`).
+
+- [ ] **Step 4: Implement the store**
+
+Insert this `impl` block in `crates/master/src/store/sqlite.rs` between `impl SqliteStore { … }` and `#[cfg(test)]`:
+
+```rust
+#[async_trait]
+impl AgentStore for SqliteStore {
+    async fn upsert_on_register(&self, i: RegisterInfo) -> anyhow::Result<AgentRecord> {
+        // name updated only on INSERT; ON CONFLICT keeps the existing name.
+        let rec = sqlx::query_as::<_, AgentRow>(
+            r#"
+            INSERT INTO agents (agent_id, name, hostname, os, arch, version, last_seen_unix_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                hostname          = excluded.hostname,
+                os                = excluded.os,
+                arch              = excluded.arch,
+                version           = excluded.version,
+                last_seen_unix_ms = excluded.last_seen_unix_ms
+            RETURNING agent_id, name, hostname, os, arch, version, last_seen_unix_ms
+            "#,
+        )
+        .bind(&i.agent_id).bind(&i.name).bind(&i.hostname).bind(&i.os)
+        .bind(&i.arch).bind(&i.version).bind(i.last_seen_unix_ms)
+        .fetch_one(&self.pool).await?;
+        Ok(rec.into())
+    }
+
+    async fn get(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
+        let row = sqlx::query_as::<_, AgentRow>(
+            "SELECT agent_id, name, hostname, os, arch, version, last_seen_unix_ms FROM agents WHERE agent_id = ?",
+        ).bind(agent_id).fetch_optional(&self.pool).await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<AgentRecord>> {
+        let rows = sqlx::query_as::<_, AgentRow>(
+            "SELECT agent_id, name, hostname, os, arch, version, last_seen_unix_ms FROM agents ORDER BY name",
+        ).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn set_name(&self, agent_id: &str, name: &str) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE agents SET name = ? WHERE agent_id = ?")
+            .bind(name).bind(agent_id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn update_last_seen(&self, agent_id: &str, ts_ms: i64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE agents SET last_seen_unix_ms = ? WHERE agent_id = ?")
+            .bind(ts_ms).bind(agent_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn delete(&self, agent_id: &str) -> anyhow::Result<bool> {
+        let r = sqlx::query("DELETE FROM agents WHERE agent_id = ?")
+            .bind(agent_id).execute(&self.pool).await?;
+        Ok(r.rows_affected() > 0)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AgentRow {
+    agent_id: String,
+    name: String,
+    hostname: String,
+    os: String,
+    arch: String,
+    version: String,
+    last_seen_unix_ms: i64,
+}
+
+impl From<AgentRow> for AgentRecord {
+    fn from(r: AgentRow) -> Self {
+        AgentRecord {
+            agent_id: r.agent_id, name: r.name, hostname: r.hostname,
+            os: r.os, arch: r.arch, version: r.version,
+            last_seen_unix_ms: r.last_seen_unix_ms,
+        }
+    }
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `cargo test -p faultforge-master --lib store::sqlite`
+Expected: PASS (4 tests).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/master/migrations crates/master/src/store/sqlite.rs
+git commit -m "feat(master): SQLite AgentStore with reseed-only-on-first-registration"
+```
+
+---
+
+## Task 3: Connection registry & status logic
+
+**Files:**
+- Create: `crates/master/src/registry.rs`
+- Modify: `crates/master/src/main.rs` (add `mod registry;`)
+
+- [ ] **Step 1: Write the failing test**
+
+Create `crates/master/src/registry.rs`:
+
+```rust
+//! In-memory registry of live agent connections. Source of truth for
+//! Connected/Stale; the durable store knows nothing about live streams.
+
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentStatus {
+    Connected,
+    Stale,
+    Disconnected,
+}
+
+/// Handle returned to a connection's owning task: a unique id (for ownership
+/// checks — CancellationToken has no identity comparison) plus its cancel token.
+#[derive(Clone)]
+pub struct ConnHandle {
+    pub id: u64,
+    pub cancel: CancellationToken,
+}
+
+struct Conn {
+    id: u64,
+    last_seen_ms: AtomicI64,
+    cancel: CancellationToken,
+}
+
+#[derive(Clone, Default)]
+pub struct ConnectionRegistry {
+    conns: Arc<DashMap<String, Arc<Conn>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl ConnectionRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    /// Register a live connection for `agent_id`. If one already exists it is
+    /// superseded: its CancellationToken is fired (so the old stream task ends)
+    /// and replaced. Returns a handle identifying THIS connection.
+    pub fn insert(&self, agent_id: &str, last_seen_ms: i64) -> ConnHandle {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = CancellationToken::new();
+        let conn = Arc::new(Conn {
+            id,
+            last_seen_ms: AtomicI64::new(last_seen_ms),
+            cancel: cancel.clone(),
+        });
+        if let Some(old) = self.conns.insert(agent_id.to_string(), conn) {
+            old.cancel.cancel(); // supersede the previous stream
+        }
+        ConnHandle { id, cancel }
+    }
+
+    /// Record a heartbeat. No-op if the agent isn't currently connected.
+    pub fn touch(&self, agent_id: &str, ts_ms: i64) {
+        if let Some(c) = self.conns.get(agent_id) {
+            c.last_seen_ms.store(ts_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove a connection ONLY if it is still the one identified by `handle`
+    /// (avoids a superseding connection removing its successor).
+    pub fn remove_if_owner(&self, agent_id: &str, handle: &ConnHandle) {
+        self.conns.remove_if(agent_id, |_, c| c.id == handle.id);
+    }
+
+    pub fn last_seen(&self, agent_id: &str) -> Option<i64> {
+        self.conns.get(agent_id).map(|c| c.last_seen_ms.load(Ordering::Relaxed))
+    }
+
+    /// Compute status from presence + freshness.
+    pub fn status(&self, agent_id: &str, now_ms: i64, stale_after_ms: i64) -> AgentStatus {
+        match self.last_seen(agent_id) {
+            None => AgentStatus::Disconnected,
+            Some(ls) if now_ms - ls <= stale_after_ms => AgentStatus::Connected,
+            Some(_) => AgentStatus::Stale,
+        }
+    }
+
+    /// Agents whose connection is older than `dead_after_ms`; used by the sweep.
+    pub fn dead_connections(&self, now_ms: i64, dead_after_ms: i64) -> Vec<(String, i64)> {
+        self.conns
+            .iter()
+            .filter_map(|e| {
+                let ls = e.value().last_seen_ms.load(Ordering::Relaxed);
+                (now_ms - ls > dead_after_ms).then(|| (e.key().clone(), ls))
+            })
+            .collect()
+    }
+
+    /// Force-remove and cancel a connection (sweep path).
+    pub fn evict(&self, agent_id: &str) {
+        if let Some((_, c)) = self.conns.remove(agent_id) {
+            c.cancel.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_transitions_with_freshness() {
+        let r = ConnectionRegistry::new();
+        let _c = r.insert("a", 1_000);
+        assert_eq!(r.status("a", 1_000, 30), AgentStatus::Connected);
+        assert_eq!(r.status("a", 1_050, 30), AgentStatus::Stale);
+        assert_eq!(r.status("missing", 1_050, 30), AgentStatus::Disconnected);
+    }
+
+    #[test]
+    fn insert_supersedes_old_connection() {
+        let r = ConnectionRegistry::new();
+        let first = r.insert("a", 1);
+        let _second = r.insert("a", 2);
+        assert!(first.cancel.is_cancelled(), "old connection must be cancelled");
+    }
+
+    #[test]
+    fn touch_updates_last_seen() {
+        let r = ConnectionRegistry::new();
+        let _c = r.insert("a", 1);
+        r.touch("a", 99);
+        assert_eq!(r.last_seen("a"), Some(99));
+    }
+
+    #[test]
+    fn remove_if_owner_respects_supersede() {
+        let r = ConnectionRegistry::new();
+        let first = r.insert("a", 1);
+        let _second = r.insert("a", 2); // supersedes; `first` cancelled
+        r.remove_if_owner("a", &first); // stale task cleaning up must NOT evict successor
+        assert!(r.last_seen("a").is_some(), "successor must survive");
+    }
+
+    #[test]
+    fn dead_connections_lists_old_entries() {
+        let r = ConnectionRegistry::new();
+        let _c = r.insert("a", 1_000);
+        assert!(r.dead_connections(1_010, 5).iter().any(|(id, _)| id == "a"));
+        assert!(r.dead_connections(1_002, 5).is_empty());
+    }
+}
+```
+
+- [ ] **Step 2: Register the module**
+
+Edit `crates/master/src/main.rs` to:
+
+```rust
+mod store;
+mod registry;
+
+fn main() {
+    println!("faultforge-master (stub)");
+}
+```
+
+- [ ] **Step 3: Run tests to verify they fail then pass**
+
+Run: `cargo test -p faultforge-master --lib registry`
+Expected: PASS (the code above is the implementation; if `remove_if` API differs by dashmap version, adjust to `self.conns.remove_if(agent_id, |_, c| c.cancel.same_token(cancel))`).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/master/src/registry.rs crates/master/src/main.rs
+git commit -m "feat(master): in-memory connection registry + status logic"
+```
+
+---
+
+## Task 4: gRPC Connect handler
+
+**Files:**
+- Create: `crates/master/src/grpc.rs`
+- Modify: `crates/master/src/main.rs` (`mod grpc;`)
+
+- [ ] **Step 1: Implement the bidi handler**
+
+Create `crates/master/src/grpc.rs`:
+
+```rust
+//! tonic AgentService: the single bidirectional Connect stream.
+
+use crate::registry::ConnectionRegistry;
+use crate::store::{AgentStore, RegisterInfo};
+use faultforge_proto::now_unix_ms;
+use faultforge_proto::v1::{
+    agent_message::Payload as InPayload, agent_service_server::AgentService,
+    server_message::Payload as OutPayload, AgentMessage, RegisterAck, ServerMessage,
+};
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
+use tonic::{Request, Response, Status, Streaming};
+
+pub struct GrpcService {
+    pub store: Arc<dyn AgentStore>,
+    pub registry: ConnectionRegistry,
+    pub heartbeat_interval_secs: u32,
+}
+
+type OutStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl AgentService for GrpcService {
+    type ConnectStream = OutStream;
+
+    async fn connect(
+        &self,
+        request: Request<Streaming<AgentMessage>>,
+    ) -> Result<Response<Self::ConnectStream>, Status> {
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel::<Result<ServerMessage, Status>>(16);
+
+        let store = self.store.clone();
+        let registry = self.registry.clone();
+        let hb = self.heartbeat_interval_secs;
+
+        tokio::spawn(async move {
+            // 1. First frame MUST be Register.
+            let reg = match inbound.next().await {
+                Some(Ok(AgentMessage { payload: Some(InPayload::Register(r)) })) => r,
+                _ => {
+                    let _ = tx.send(Err(Status::invalid_argument("expected Register first"))).await;
+                    return;
+                }
+            };
+            let agent_id = reg.agent_id.clone();
+            if agent_id.is_empty() {
+                let _ = tx.send(Err(Status::invalid_argument("empty agent_id"))).await;
+                return;
+            }
+
+            // 2. Persist (reseed-only rule lives in the store) + register live conn.
+            let ts = now_unix_ms();
+            if let Err(e) = store
+                .upsert_on_register(RegisterInfo {
+                    agent_id: agent_id.clone(), name: reg.name, hostname: reg.hostname,
+                    os: reg.os, arch: reg.arch, version: reg.version, last_seen_unix_ms: ts,
+                })
+                .await
+            {
+                tracing::error!(%agent_id, error=%e, "register persist failed");
+                let _ = tx.send(Err(Status::internal("register failed"))).await;
+                return;
+            }
+            let handle = registry.insert(&agent_id, ts);
+            tracing::info!(%agent_id, "agent connected");
+
+            // 3. Ack with the cadence the agent should heartbeat at.
+            let ack = ServerMessage {
+                payload: Some(OutPayload::RegisterAck(RegisterAck {
+                    server_time_unix_ms: ts,
+                    heartbeat_interval_secs: hb,
+                })),
+            };
+            if tx.send(Ok(ack)).await.is_err() {
+                registry.remove_if_owner(&agent_id, &handle);
+                return;
+            }
+
+            // 4. Pump heartbeats until the stream ends or we're superseded.
+            loop {
+                tokio::select! {
+                    _ = handle.cancel.cancelled() => {
+                        tracing::info!(%agent_id, "connection superseded");
+                        break; // a newer stream owns this agent now
+                    }
+                    msg = inbound.next() => match msg {
+                        Some(Ok(AgentMessage { payload: Some(InPayload::Heartbeat(_)) })) => {
+                            registry.touch(&agent_id, now_unix_ms());
+                        }
+                        Some(Ok(_)) => {} // ignore unexpected frames (e.g. a second Register)
+                        Some(Err(e)) => { tracing::warn!(%agent_id, error=%e, "stream error"); break; }
+                        None => { tracing::info!(%agent_id, "agent disconnected"); break; }
+                    }
+                }
+            }
+
+            // 5. Cleanup: persist last_seen, drop the handle if we still own it.
+            if let Some(ls) = registry.last_seen(&agent_id) {
+                let _ = store.update_last_seen(&agent_id, ls).await;
+            }
+            registry.remove_if_owner(&agent_id, &handle);
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+```
+
+- [ ] **Step 2: Register the module**
+
+Edit `crates/master/src/main.rs`, add `mod grpc;` to the module list.
+
+- [ ] **Step 3: Build**
+
+Run: `cargo build -p faultforge-master`
+Expected: PASS. (If the generated `oneof` wrapper struct field name differs, match the `AgentMessage { payload: Some(...) }` destructuring to the generated type — prost names the field after the `oneof`, here `payload`.)
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/master/src/grpc.rs crates/master/src/main.rs
+git commit -m "feat(master): gRPC Connect bidi handler (register, heartbeat, supersede)"
+```
+
+---
+
+## Task 5: Staleness sweep
+
+**Files:**
+- Create: `crates/master/src/sweep.rs`
+- Modify: `crates/master/src/main.rs` (`mod sweep;`)
+
+- [ ] **Step 1: Implement the sweep**
+
+Create `crates/master/src/sweep.rs`:
+
+```rust
+//! Background task that evicts dead/zombie connections (half-open TCP where the
+//! agent host died without a clean FIN), turning Stale → Disconnected and
+//! persisting last_seen.
+
+use crate::registry::ConnectionRegistry;
+use crate::store::AgentStore;
+use faultforge_proto::now_unix_ms;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub fn spawn_sweep(
+    registry: ConnectionRegistry,
+    store: Arc<dyn AgentStore>,
+    interval: Duration,
+    dead_after_ms: i64,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            let now = now_unix_ms();
+            for (agent_id, last_seen) in registry.dead_connections(now, dead_after_ms) {
+                tracing::warn!(%agent_id, "evicting dead connection");
+                let _ = store.update_last_seen(&agent_id, last_seen).await;
+                registry.evict(&agent_id); // cancels the zombie stream task
+            }
+        }
+    });
+}
+```
+
+- [ ] **Step 2: Register the module & build**
+
+Edit `crates/master/src/main.rs`, add `mod sweep;`.
+Run: `cargo build -p faultforge-master`
+Expected: PASS.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/master/src/sweep.rs crates/master/src/main.rs
+git commit -m "feat(master): background staleness/dead-connection sweep"
+```
+
+---
+
+## Task 6: REST API
+
+**Files:**
+- Create: `crates/master/src/rest.rs`
+- Modify: `crates/master/src/main.rs` (`mod rest;`)
+
+- [ ] **Step 1: Implement the router & handlers**
+
+Create `crates/master/src/rest.rs`:
+
+```rust
+//! axum REST API for operators. Status = join of durable record + live registry.
+
+use crate::registry::{AgentStatus, ConnectionRegistry};
+use crate::store::AgentStore;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
+use faultforge_proto::now_unix_ms;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Arc<dyn AgentStore>,
+    pub registry: ConnectionRegistry,
+    pub stale_after_ms: i64,
+}
+
+#[derive(Serialize)]
+pub struct AgentView {
+    pub agent_id: String,
+    pub name: String,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub version: String,
+    pub last_seen_unix_ms: i64,
+    pub status: AgentStatus,
+}
+
+impl AppState {
+    fn view(&self, rec: crate::store::AgentRecord, now: i64) -> AgentView {
+        // Prefer the live in-memory last_seen when connected.
+        let last_seen = self.registry.last_seen(&rec.agent_id).unwrap_or(rec.last_seen_unix_ms);
+        AgentView {
+            status: self.registry.status(&rec.agent_id, now, self.stale_after_ms),
+            agent_id: rec.agent_id, name: rec.name, hostname: rec.hostname,
+            os: rec.os, arch: rec.arch, version: rec.version, last_seen_unix_ms: last_seen,
+        }
+    }
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/api/v1/agents", get(list_agents))
+        .route(
+            "/api/v1/agents/:id",
+            get(get_agent).patch(rename_agent).delete(delete_agent),
+        )
+        .with_state(state)
+}
+
+async fn healthz() -> &'static str { "ok" }
+
+async fn list_agents(State(s): State<AppState>) -> Result<Json<Vec<AgentView>>, StatusCode> {
+    let now = now_unix_ms();
+    let recs = s.store.list().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(recs.into_iter().map(|r| s.view(r, now)).collect()))
+}
+
+async fn get_agent(
+    State(s): State<AppState>, Path(id): Path<String>,
+) -> Result<Json<AgentView>, StatusCode> {
+    let now = now_unix_ms();
+    match s.store.get(&id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+        Some(r) => Ok(Json(s.view(r, now))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameBody { name: String }
+
+async fn rename_agent(
+    State(s): State<AppState>, Path(id): Path<String>, Json(body): Json<RenameBody>,
+) -> StatusCode {
+    match s.store.set_name(&id, &body.name).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn delete_agent(State(s): State<AppState>, Path(id): Path<String>) -> StatusCode {
+    s.registry.evict(&id); // drop any live handle
+    match s.store.delete(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+```
+
+- [ ] **Step 2: Write a router smoke test**
+
+Append to `crates/master/src/rest.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::sqlite::SqliteStore;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // oneshot
+
+    async fn app() -> Router {
+        let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+        router(AppState { store, registry: ConnectionRegistry::new(), stale_after_ms: 30_000 })
+    }
+
+    #[tokio::test]
+    async fn healthz_ok() {
+        let resp = app().await
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn empty_list_is_ok() {
+        let resp = app().await
+            .oneshot(Request::builder().uri("/api/v1/agents").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rename_missing_is_404() {
+        let resp = app().await
+            .oneshot(
+                Request::builder().method("PATCH").uri("/api/v1/agents/nope")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"x"}"#)).unwrap(),
+            ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+```
+
+Also make the store module test-visible: ensure `crates/master/src/store/mod.rs` has `pub mod sqlite;` (already added in Task 1) and `main.rs` declares `mod rest;`.
+
+- [ ] **Step 3: Run tests**
+
+Run: `cargo test -p faultforge-master --lib rest`
+Expected: PASS (3 tests). If axum's path-param syntax differs in your version, use `/api/v1/agents/{id}` (axum 0.8) instead of `:id` (axum 0.7).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/master/src/rest.rs crates/master/src/main.rs
+git commit -m "feat(master): axum REST API (list/get/rename/delete + healthz)"
+```
+
+---
+
+## Task 7: Master config & wiring
+
+**Files:**
+- Create: `crates/master/src/config.rs`
+- Rewrite: `crates/master/src/main.rs`
+
+- [ ] **Step 1: Config**
+
+Create `crates/master/src/config.rs`:
+
+```rust
+use clap::Parser;
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "faultforge-master", version)]
+pub struct MasterConfig {
+    /// gRPC listen address (agents dial this).
+    #[arg(long, env = "FF_GRPC_ADDR", default_value = "0.0.0.0:50051")]
+    pub grpc_addr: String,
+    /// REST/HTTP listen address (operators/CLI).
+    #[arg(long, env = "FF_REST_ADDR", default_value = "0.0.0.0:8080")]
+    pub rest_addr: String,
+    /// SQLite URL.
+    #[arg(long, env = "FF_DB_URL", default_value = "sqlite://faultforge.db")]
+    pub db_url: String,
+    /// Heartbeat cadence the master hands agents (seconds).
+    #[arg(long, env = "FF_HEARTBEAT_SECS", default_value_t = 10)]
+    pub heartbeat_secs: u32,
+    /// Stale multiplier N: stale_after = heartbeat * N; dead_after = stale * 2.
+    #[arg(long, env = "FF_STALE_MULT", default_value_t = 3)]
+    pub stale_mult: u32,
+}
+
+impl MasterConfig {
+    pub fn stale_after_ms(&self) -> i64 { (self.heartbeat_secs * self.stale_mult) as i64 * 1000 }
+    pub fn dead_after_ms(&self) -> i64 { self.stale_after_ms() * 2 }
+}
+```
+
+- [ ] **Step 2: Wire everything in main**
+
+Rewrite `crates/master/src/main.rs`:
+
+```rust
+mod config;
+mod grpc;
+mod registry;
+mod rest;
+mod store;
+mod sweep;
+
+use crate::config::MasterConfig;
+use crate::grpc::GrpcService;
+use crate::registry::ConnectionRegistry;
+use crate::rest::AppState;
+use crate::store::sqlite::SqliteStore;
+use crate::store::AgentStore;
+use clap::Parser;
+use faultforge_proto::v1::agent_service_server::AgentServiceServer;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .init();
+    let cfg = MasterConfig::parse();
+
+    let store: Arc<dyn AgentStore> = Arc::new(SqliteStore::connect(&cfg.db_url).await?);
+    let registry = ConnectionRegistry::new();
+
+    sweep::spawn_sweep(registry.clone(), store.clone(), Duration::from_secs(cfg.heartbeat_secs as u64), cfg.dead_after_ms());
+
+    // gRPC server
+    let grpc = GrpcService {
+        store: store.clone(),
+        registry: registry.clone(),
+        heartbeat_interval_secs: cfg.heartbeat_secs,
+    };
+    let grpc_addr = cfg.grpc_addr.parse()?;
+    let grpc_server = tonic::transport::Server::builder()
+        .add_service(AgentServiceServer::new(grpc))
+        .serve(grpc_addr);
+
+    // REST server
+    let app = rest::router(AppState {
+        store: store.clone(),
+        registry: registry.clone(),
+        stale_after_ms: cfg.stale_after_ms(),
+    });
+    let listener = tokio::net::TcpListener::bind(&cfg.rest_addr).await?;
+
+    tracing::info!(grpc = %cfg.grpc_addr, rest = %cfg.rest_addr, "faultforge-master started");
+    tokio::select! {
+        r = grpc_server => r?,
+        r = axum::serve(listener, app) => r?,
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 3: Build & run**
+
+Run: `cargo run -p faultforge-master`
+Expected: logs "faultforge-master started"; `curl localhost:8080/healthz` → `ok`. Ctrl-C to stop. (Creates `faultforge.db`.)
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/master/src/config.rs crates/master/src/main.rs
+git commit -m "feat(master): config + wire gRPC, REST, sweep, store together"
+```
+
+---
+
+## Task 8: Agent
+
+**Files:**
+- Create: `crates/agent/Cargo.toml`, `crates/agent/src/{main,config,state,client}.rs`
+
+- [ ] **Step 1: Agent crate manifest**
+
+Create `crates/agent/Cargo.toml`:
+
+```toml
+[package]
+name = "faultforge-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "faultforge-agent"
+path = "src/main.rs"
+
+[dependencies]
+faultforge-proto = { path = "../proto" }
+tokio.workspace = true
+tonic.workspace = true
+prost.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+clap.workspace = true
+tokio-stream = "0.1"
+rand = "0.8"
+hostname = "0.4"
+```
+
+- [ ] **Step 2: Local state (agent_id persistence) — write the failing test**
+
+Create `crates/agent/src/state.rs`:
+
+```rust
+//! Agent local state: a stable, self-generated agent_id persisted to disk.
+
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentState {
+    pub agent_id: String,
+}
+
+impl AgentState {
+    /// Load the state file, or generate a new UUID and persist it on first run.
+    pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
+        if path.exists() {
+            let raw = std::fs::read_to_string(path)?;
+            Ok(serde_json::from_str(&raw)?)
+        } else {
+            let state = AgentState { agent_id: uuid::Uuid::new_v4().to_string() };
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() { std::fs::create_dir_all(parent)?; }
+            }
+            std::fs::write(path, serde_json::to_string_pretty(&state)?)?;
+            Ok(state)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generates_then_reuses_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let a = AgentState::load_or_create(&path).unwrap();
+        let b = AgentState::load_or_create(&path).unwrap();
+        assert_eq!(a.agent_id, b.agent_id, "agent_id must persist across loads");
+        assert!(!a.agent_id.is_empty());
+    }
+}
+```
+
+Add `tempfile = "3"` to `crates/agent/Cargo.toml` `[dev-dependencies]`.
+
+- [ ] **Step 3: Run the test**
+
+Run: `cargo test -p faultforge-agent --bin faultforge-agent state` (add `mod state;` to main first — see Step 6).
+Expected: PASS.
+
+- [ ] **Step 4: Config**
+
+Create `crates/agent/src/config.rs`:
+
+```rust
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "faultforge-agent", version)]
+pub struct AgentConfig {
+    /// Master gRPC endpoint.
+    #[arg(long, env = "FF_MASTER_URL", default_value = "http://127.0.0.1:50051")]
+    pub master_url: String,
+    /// Where to persist this agent's stable id.
+    #[arg(long, env = "FF_STATE_PATH", default_value = "faultforge-agent-state.json")]
+    pub state_path: PathBuf,
+    /// Optional name override (otherwise the hostname seeds the master record).
+    #[arg(long, env = "FF_AGENT_NAME")]
+    pub name: Option<String>,
+    /// Reconnect backoff bounds (seconds).
+    #[arg(long, env = "FF_BACKOFF_MIN", default_value_t = 1)]
+    pub backoff_min_secs: u64,
+    #[arg(long, env = "FF_BACKOFF_MAX", default_value_t = 30)]
+    pub backoff_max_secs: u64,
+}
+```
+
+- [ ] **Step 5: Client (dial, register, heartbeat, backoff)**
+
+Create `crates/agent/src/client.rs`:
+
+```rust
+//! Dial the master, register, heartbeat at the cadence the master dictates,
+//! and reconnect forever with exponential backoff + jitter.
+
+use crate::config::AgentConfig;
+use faultforge_proto::v1::{
+    agent_message::Payload, agent_service_client::AgentServiceClient,
+    server_message::Payload as InPayload, AgentMessage, Heartbeat, Register,
+};
+use rand::Rng;
+use std::time::Duration;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+
+pub async fn run(cfg: AgentConfig, agent_id: String) -> anyhow::Result<()> {
+    let name = cfg.name.clone().unwrap_or_else(default_hostname);
+    let mut backoff = cfg.backoff_min_secs;
+    loop {
+        match connect_once(&cfg, &agent_id, &name).await {
+            Ok(()) => { backoff = cfg.backoff_min_secs; } // clean disconnect: reset
+            Err(e) => tracing::warn!(error = %e, "connection ended; will retry"),
+        }
+        let jitter = rand::thread_rng().gen_range(0..=backoff);
+        let wait = backoff + jitter;
+        tracing::info!(secs = wait, "reconnecting after backoff");
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        backoff = (backoff * 2).min(cfg.backoff_max_secs);
+    }
+}
+
+async fn connect_once(cfg: &AgentConfig, agent_id: &str, name: &str) -> anyhow::Result<()> {
+    let mut client = AgentServiceClient::connect(cfg.master_url.clone()).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<AgentMessage>(8);
+
+    // First frame: Register.
+    tx.send(AgentMessage {
+        payload: Some(Payload::Register(Register {
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            hostname: default_hostname(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })),
+    }).await?;
+
+    let outbound = ReceiverStream::new(rx);
+    let mut inbound = client.connect(outbound).await?.into_inner();
+
+    // Await RegisterAck to learn the heartbeat cadence.
+    let interval_secs = match inbound.next().await {
+        Some(Ok(msg)) => match msg.payload {
+            Some(InPayload::RegisterAck(ack)) => ack.heartbeat_interval_secs.max(1),
+            _ => anyhow::bail!("expected RegisterAck"),
+        },
+        Some(Err(e)) => anyhow::bail!("register rejected: {e}"),
+        None => anyhow::bail!("stream closed before ack"),
+    };
+    tracing::info!(%agent_id, interval_secs, "registered with master");
+
+    // Heartbeat loop; also drain inbound so a server-side close is observed.
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs as u64));
+    ticker.tick().await; // consume immediate first tick
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if tx.send(AgentMessage { payload: Some(Payload::Heartbeat(Heartbeat {})) }).await.is_err() {
+                    anyhow::bail!("outbound channel closed");
+                }
+            }
+            inb = inbound.next() => match inb {
+                Some(Ok(_)) => {} // future: handle Command here
+                Some(Err(e)) => anyhow::bail!("inbound error: {e}"),
+                None => return Ok(()), // master closed the stream cleanly
+            }
+        }
+    }
+}
+
+fn default_hostname() -> String {
+    hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "unknown".into())
+}
+```
+
+- [ ] **Step 6: main**
+
+Create `crates/agent/src/main.rs`:
+
+```rust
+mod client;
+mod config;
+mod state;
+
+use crate::config::AgentConfig;
+use crate::state::AgentState;
+use clap::Parser;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .init();
+    let cfg = AgentConfig::parse();
+    let state = AgentState::load_or_create(&cfg.state_path)?;
+    tracing::info!(agent_id = %state.agent_id, master = %cfg.master_url, "starting faultforge-agent");
+    client::run(cfg, state.agent_id).await
+}
+```
+
+- [ ] **Step 7: Build & unit test**
+
+Run: `cargo test -p faultforge-agent` then `cargo build -p faultforge-agent`
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add crates/agent
+git commit -m "feat(agent): stable id, dial/register/heartbeat, reconnect backoff"
+```
+
+---
+
+## Task 9: Operator CLI
+
+**Files:**
+- Create: `crates/cli/Cargo.toml`, `crates/cli/src/main.rs`
+
+- [ ] **Step 1: CLI crate manifest**
+
+Create `crates/cli/Cargo.toml`:
+
+```toml
+[package]
+name = "faultforge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "faultforge"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
+```
+
+- [ ] **Step 2: Implement the CLI**
+
+Create `crates/cli/src/main.rs`:
+
+```rust
+use clap::{Parser, Subcommand};
+use serde::Deserialize;
+
+#[derive(Parser)]
+#[command(name = "faultforge", version)]
+struct Cli {
+    /// Master REST base URL.
+    #[arg(long, env = "FF_MASTER_REST", default_value = "http://127.0.0.1:8080")]
+    master_url: String,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Manage agents.
+    Agents {
+        #[command(subcommand)]
+        action: AgentCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    List,
+    Show { id: String },
+    Rename { id: String, name: String },
+    Rm { id: String },
+}
+
+#[derive(Deserialize)]
+struct AgentView {
+    agent_id: String,
+    name: String,
+    hostname: String,
+    os: String,
+    arch: String,
+    version: String,
+    status: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let base = cli.master_url.trim_end_matches('/').to_string();
+    let http = reqwest::Client::new();
+
+    match cli.cmd {
+        Cmd::Agents { action } => match action {
+            AgentCmd::List => {
+                let agents: Vec<AgentView> =
+                    http.get(format!("{base}/api/v1/agents")).send().await?.error_for_status()?.json().await?;
+                println!("{:<38} {:<14} {:<12} {:<16} {}", "AGENT_ID", "NAME", "STATUS", "OS/ARCH", "VERSION");
+                for a in agents {
+                    println!("{:<38} {:<14} {:<12} {:<16} {}",
+                        a.agent_id, a.name, a.status, format!("{}/{}", a.os, a.arch), a.version);
+                }
+            }
+            AgentCmd::Show { id } => {
+                let a: AgentView =
+                    http.get(format!("{base}/api/v1/agents/{id}")).send().await?.error_for_status()?.json().await?;
+                println!("id:       {}\nname:     {}\nhostname: {}\nos/arch:  {}/{}\nversion:  {}\nstatus:   {}",
+                    a.agent_id, a.name, a.hostname, a.os, a.arch, a.version, a.status);
+            }
+            AgentCmd::Rename { id, name } => {
+                http.patch(format!("{base}/api/v1/agents/{id}"))
+                    .json(&serde_json::json!({ "name": name })).send().await?.error_for_status()?;
+                println!("renamed {id} -> {name}");
+            }
+            AgentCmd::Rm { id } => {
+                http.delete(format!("{base}/api/v1/agents/{id}")).send().await?.error_for_status()?;
+                println!("removed {id}");
+            }
+        },
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 3: Build**
+
+Run: `cargo build -p faultforge-cli`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/cli
+git commit -m "feat(cli): faultforge agents list/show/rename/rm over REST"
+```
+
+---
+
+## Task 10: End-to-end integration test
+
+**Files:**
+- Create: `crates/master/tests/e2e.rs`
+
+This test boots the real gRPC server + REST router in-process on ephemeral ports, drives a real agent client, and asserts the lifecycle.
+
+- [ ] **Step 1: Expose what the test needs**
+
+The test reuses master internals; make modules reachable from an integration test by adding a tiny lib target. Create `crates/master/src/lib.rs`:
+
+```rust
+pub mod config;
+pub mod grpc;
+pub mod registry;
+pub mod rest;
+pub mod store;
+pub mod sweep;
+```
+
+Add to `crates/master/Cargo.toml` under `[package]` section (after the `[[bin]]`):
+
+```toml
+[lib]
+name = "faultforge_master"
+path = "src/lib.rs"
+```
+
+And change `crates/master/src/main.rs`'s module declarations to use the lib:
+
+```rust
+use faultforge_master::{config::MasterConfig, grpc::GrpcService, registry::ConnectionRegistry,
+    rest::AppState, store::sqlite::SqliteStore, store::AgentStore, sweep};
+```
+
+(Delete the `mod ...;` lines from `main.rs`; everything now lives in the lib. Keep the `#[tokio::main] async fn main` body, adjusting paths to the `use` above.)
+
+Add the agent crate as a dev-dependency for the test driver — simplest is to call the master over gRPC using the generated client directly, so we depend only on `faultforge-proto`. Add to `crates/master/Cargo.toml` `[dev-dependencies]`: `faultforge-proto = { path = "../proto" }` and `tokio-stream = "0.1"`.
+
+- [ ] **Step 2: Write the e2e test**
+
+Create `crates/master/tests/e2e.rs`:
+
+```rust
+use faultforge_master::{grpc::GrpcService, registry::{AgentStatus, ConnectionRegistry},
+    store::{sqlite::SqliteStore, AgentStore}};
+use faultforge_proto::v1::{
+    agent_message::Payload, agent_service_client::AgentServiceClient,
+    agent_service_server::AgentServiceServer, AgentMessage, Heartbeat, Register,
+};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+
+async fn boot() -> (String, ConnectionRegistry, Arc<dyn AgentStore>) {
+    let store: Arc<dyn AgentStore> = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+    let registry = ConnectionRegistry::new();
+    let svc = GrpcService { store: store.clone(), registry: registry.clone(), heartbeat_interval_secs: 1 };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(AgentServiceServer::new(svc))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await.unwrap();
+    });
+    (format!("http://{addr}"), registry, store)
+}
+
+fn register(agent_id: &str, name: &str) -> AgentMessage {
+    AgentMessage { payload: Some(Payload::Register(Register {
+        agent_id: agent_id.into(), name: name.into(), hostname: "h".into(),
+        os: "linux".into(), arch: "x86_64".into(), version: "0.1.0".into(),
+    })) }
+}
+
+#[tokio::test]
+async fn agent_registers_heartbeats_and_disconnect_is_detected() {
+    let (url, registry, store) = boot().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = AgentServiceClient::connect(url).await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel::<AgentMessage>(8);
+    tx.send(register("a1", "web-01")).await.unwrap();
+    let mut inbound = client.connect(ReceiverStream::new(rx)).await.unwrap().into_inner();
+
+    // Receive RegisterAck.
+    let ack = inbound.next().await.unwrap().unwrap();
+    assert!(matches!(ack.payload,
+        Some(faultforge_proto::v1::server_message::Payload::RegisterAck(_))));
+
+    // Persisted + Connected.
+    assert!(store.get("a1").await.unwrap().is_some());
+    assert_eq!(registry.status("a1", faultforge_proto::now_unix_ms(), 5_000), AgentStatus::Connected);
+
+    // Heartbeat keeps it fresh.
+    tx.send(AgentMessage { payload: Some(Payload::Heartbeat(Heartbeat {})) }).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(registry.last_seen("a1").is_some());
+
+    // Drop the agent → stream closes → handler removes the handle → Disconnected.
+    drop(tx);
+    drop(inbound);
+    drop(client);
+    for _ in 0..50 {
+        if registry.last_seen("a1").is_none() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(registry.status("a1", faultforge_proto::now_unix_ms(), 5_000), AgentStatus::Disconnected);
+}
+
+#[tokio::test]
+async fn rename_survives_reconnect() {
+    let (url, _registry, store) = boot().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // First registration seeds name = hostname-ish ("web-01").
+    let mut c1 = AgentServiceClient::connect(url.clone()).await.unwrap();
+    let (tx1, rx1) = tokio::sync::mpsc::channel::<AgentMessage>(8);
+    tx1.send(register("a1", "web-01")).await.unwrap();
+    let mut in1 = c1.connect(ReceiverStream::new(rx1)).await.unwrap().into_inner();
+    in1.next().await; // ack
+    drop(tx1); drop(in1);
+
+    // Admin renames.
+    assert!(store.set_name("a1", "renamed").await.unwrap());
+
+    // Agent reconnects reporting its old default name; master keeps "renamed".
+    let mut c2 = AgentServiceClient::connect(url).await.unwrap();
+    let (tx2, rx2) = tokio::sync::mpsc::channel::<AgentMessage>(8);
+    tx2.send(register("a1", "web-01")).await.unwrap();
+    let mut in2 = c2.connect(ReceiverStream::new(rx2)).await.unwrap().into_inner();
+    in2.next().await; // ack
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.get("a1").await.unwrap().unwrap().name, "renamed");
+}
+```
+
+- [ ] **Step 3: Run the e2e tests**
+
+Run: `cargo test -p faultforge-master --test e2e`
+Expected: PASS (2 tests). If the disconnect test flakes, raise the poll loop count — stream teardown is async.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/master/src/lib.rs crates/master/src/main.rs crates/master/Cargo.toml crates/master/tests/e2e.rs
+git commit -m "test(master): e2e registration, heartbeat, disconnect, rename-survives-reconnect"
+```
+
+---
+
+## Task 11: Workspace verification & polish
+
+- [ ] **Step 1: Full test suite**
+
+Run: `cargo test --workspace`
+Expected: ALL PASS.
+
+- [ ] **Step 2: Lints & formatting**
+
+Run: `cargo clippy --workspace --all-targets -- -D warnings`
+Then: `cargo fmt --all`
+Fix any clippy findings; re-run until clean.
+
+- [ ] **Step 3: Manual smoke (the spec's verification)**
+
+In separate terminals:
+
+```bash
+# 1) master
+cargo run -p faultforge-master
+
+# 2) agent A
+FF_STATE_PATH=/tmp/ffa.json FF_AGENT_NAME=alpha cargo run -p faultforge-agent
+# 3) agent B
+FF_STATE_PATH=/tmp/ffb.json FF_AGENT_NAME=beta cargo run -p faultforge-agent
+
+# 4) operator
+cargo run -p faultforge-cli -- agents list          # both Connected
+# Ctrl-C agent A → within ~stale window:
+cargo run -p faultforge-cli -- agents list          # alpha Stale → Disconnected
+# restart agent A (same FF_STATE_PATH) → Connected again, SAME row
+cargo run -p faultforge-cli -- agents rename <id> web-01
+# restart that agent → name stays web-01
+# Ctrl-C master, restart → agents show Disconnected, then reconnect to Connected
+```
+
+Confirm each transition matches the spec's Verification section.
+
+- [ ] **Step 4: Final commit**
+
+```bash
+git add -A
+git commit -m "chore: clippy/fmt clean; FaultForge MVP registration slice complete"
+```
+
+---
+
+## Self-Review notes (covered by this plan)
+
+- **Comms/transport/persistence/operator/identity/liveness** decisions → Tasks 0,2,3,4,6,8.
+- **Reseed-only-on-first-registration** → Task 2 SQL `ON CONFLICT ... DO UPDATE` omitting `name`, tested.
+- **Two-tier state + status join** → registry (Task 3) + REST `view()` (Task 6).
+- **Supersede on reconnect** → `registry.insert` cancels old handle (Task 3, tested) + handler select on `cancel` (Task 4).
+- **Staleness sweep / dead cutoff** → Task 5 + `stale_after`/`dead_after` config (Task 7).
+- **Agent UUID persistence, hostname-default name, backoff** → Task 8 (tested).
+- **Deferred (auth/TLS, fault injection, Postgres, audit history, cloned-image collision)** → not implemented by design; structure leaves room (e.g., reserved `Command`, `AgentStore` trait).
