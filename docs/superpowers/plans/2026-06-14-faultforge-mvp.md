@@ -90,7 +90,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 ```
 
-> Versions are a floor; if `cargo build` reports a newer compatible release, prefer `cargo add` to resolve. Keep tonic/prost/tonic-build on the **same** minor.
+> Pin tonic/prost/tonic-build on the **0.12 / 0.13 / 0.12** line: this toolchain is Rust 1.87, and tonic 0.14 requires Rust 1.88. Keep tonic and tonic-build on the **same** minor. (Bump the whole set together only after upgrading the toolchain.)
 
 - [ ] **Step 2: Create the proto crate manifest**
 
@@ -109,11 +109,18 @@ prost.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
+protoc-bin-vendored = "3"   # provides a prebuilt protoc; no system install needed
 ```
 
 - [ ] **Step 3: Write the contract**
 
 Create `crates/proto/proto/faultforge.proto`:
+
+> **Note (as built):** the RPC is named `Session`, NOT `Connect` — tonic generates a
+> `connect()` constructor on the client and an RPC named `Connect` collides with it
+> (`error[E0592]: duplicate definitions with name 'connect'`). The generated client method is
+> `client.session(...)` and the server trait method/associated type are `session` /
+> `SessionStream`. Tasks 4, 8, and 10 use those names.
 
 ```proto
 syntax = "proto3";
@@ -121,7 +128,7 @@ package faultforge.v1;
 
 // One long-lived bidi stream: agent dials in, master pushes down.
 service AgentService {
-  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+  rpc Session(stream AgentMessage) returns (stream ServerMessage);
 }
 
 message AgentMessage {
@@ -157,14 +164,18 @@ message RegisterAck {
 
 - [ ] **Step 4: Wire codegen**
 
-Create `crates/proto/build.rs`:
+Create `crates/proto/build.rs` (uses a vendored protoc so no system `protoc` install is needed):
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let protoc = protoc_bin_vendored::protoc_bin_path()?;
+    std::env::set_var("PROTOC", protoc);
     tonic_build::compile_protos("proto/faultforge.proto")?;
     Ok(())
 }
 ```
+
+(The `protoc-bin-vendored` build-dependency was added in Step 2.)
 
 Create `crates/proto/src/lib.rs`:
 
@@ -187,7 +198,7 @@ pub fn now_unix_ms() -> i64 {
 - [ ] **Step 5: Build & verify codegen**
 
 Run: `cargo build -p faultforge-proto`
-Expected: PASS (compiles, generates `faultforge.v1` types). Requires `protoc` available, or rely on tonic-build's vendored `protoc` — if build fails with "protoc not found", install protobuf (`brew install protobuf`).
+Expected: PASS (compiles, generates `faultforge.v1` types). No system `protoc` needed — `build.rs` points tonic-build at the `protoc-bin-vendored` binary.
 
 - [ ] **Step 6: Commit**
 
@@ -758,12 +769,12 @@ type OutStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send
 
 #[tonic::async_trait]
 impl AgentService for GrpcService {
-    type ConnectStream = OutStream;
+    type SessionStream = OutStream;
 
-    async fn connect(
+    async fn session(
         &self,
         request: Request<Streaming<AgentMessage>>,
-    ) -> Result<Response<Self::ConnectStream>, Status> {
+    ) -> Result<Response<Self::SessionStream>, Status> {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<ServerMessage, Status>>(16);
 
@@ -1375,7 +1386,7 @@ async fn connect_once(cfg: &AgentConfig, agent_id: &str, name: &str) -> anyhow::
     }).await?;
 
     let outbound = ReceiverStream::new(rx);
-    let mut inbound = client.connect(outbound).await?.into_inner();
+    let mut inbound = client.session(outbound).await?.into_inner();
 
     // Await RegisterAck to learn the heartbeat cadence.
     let interval_secs = match inbound.next().await {
@@ -1664,7 +1675,7 @@ async fn agent_registers_heartbeats_and_disconnect_is_detected() {
     let mut client = AgentServiceClient::connect(url).await.unwrap();
     let (tx, rx) = tokio::sync::mpsc::channel::<AgentMessage>(8);
     tx.send(register("a1", "web-01")).await.unwrap();
-    let mut inbound = client.connect(ReceiverStream::new(rx)).await.unwrap().into_inner();
+    let mut inbound = client.session(ReceiverStream::new(rx)).await.unwrap().into_inner();
 
     // Receive RegisterAck.
     let ack = inbound.next().await.unwrap().unwrap();
@@ -1700,7 +1711,7 @@ async fn rename_survives_reconnect() {
     let mut c1 = AgentServiceClient::connect(url.clone()).await.unwrap();
     let (tx1, rx1) = tokio::sync::mpsc::channel::<AgentMessage>(8);
     tx1.send(register("a1", "web-01")).await.unwrap();
-    let mut in1 = c1.connect(ReceiverStream::new(rx1)).await.unwrap().into_inner();
+    let mut in1 = c1.session(ReceiverStream::new(rx1)).await.unwrap().into_inner();
     in1.next().await; // ack
     drop(tx1); drop(in1);
 
@@ -1711,7 +1722,7 @@ async fn rename_survives_reconnect() {
     let mut c2 = AgentServiceClient::connect(url).await.unwrap();
     let (tx2, rx2) = tokio::sync::mpsc::channel::<AgentMessage>(8);
     tx2.send(register("a1", "web-01")).await.unwrap();
-    let mut in2 = c2.connect(ReceiverStream::new(rx2)).await.unwrap().into_inner();
+    let mut in2 = c2.session(ReceiverStream::new(rx2)).await.unwrap().into_inner();
     in2.next().await; // ack
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(store.get("a1").await.unwrap().unwrap().name, "renamed");
