@@ -1,8 +1,17 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [ "crates/agent", "crates/cli", "crates/master","crates/proto"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
+
+# Pinned versions of the shared gRPC stack. The whole tonic/prost set moves
+# together; bump them as a group only after a matching toolchain upgrade.
+[workspace.dependencies]
+prost = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3.2.0"

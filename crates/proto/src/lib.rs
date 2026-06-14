@@ -21,8 +21,8 @@ pub fn now_unix_ms() -> i64 {
 mod tests {
     use super::now_unix_ms;
     use super::v1::{
-        agent_message, server_message, AgentMessage, Heartbeat, Register, RegisterAck,
-        ServerMessage,
+        AgentMessage, Heartbeat, Register, RegisterAck, ServerMessage, agent_message,
+        server_message,
     };
 
     #[test]

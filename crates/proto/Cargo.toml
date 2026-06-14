@@ -5,9 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-prost = "0.13"
-tonic = "0.12"
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
-protoc-bin-vendored = "3.2.0"
-tonic-build = "0.12"
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
