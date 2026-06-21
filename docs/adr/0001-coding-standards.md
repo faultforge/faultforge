@@ -28,7 +28,8 @@ outer shell. This makes core logic unit-testable without mocks.
 Pass `now: SystemTime` into functions that need the current time. Do not call
 `SystemTime::now()` inside library functions. A `Clock` trait (or equivalent injection point)
 is acceptable only at the imperative shell where I/O already lives. This keeps tests
-deterministic without introducing trait objects into every call site.
+deterministic without introducing trait objects into every call site. The preferred concrete
+type for `now` is `SystemTime`; see decision 3 for why `Instant` is rejected.
 
 ### 3. `SystemTime`, not `Instant`, for observable time
 
@@ -55,18 +56,24 @@ inside proto-generated structs).
 `///` doc comments are required on all public items and must document the contract (preconditions,
 error conditions, notable invariants). `//` inline comments appear only where the code is not
 self-explanatory — to record the reason for a non-obvious choice, not to translate Rust into
-English. Comments that restate what the code does are removed.
+English. Comments that restate what the code does are removed. Note: `#![warn(missing_docs)]` is
+not currently enforced mechanically; doc coverage on public API is a convention enforced in code
+review.
 
 ### 7. Short, single-purpose functions
 
-Each function has one responsibility and fits on a screen (~50 lines). Functions that grow beyond
-this are a signal to decompose. This applies to async handlers too: extract named helpers rather
-than nesting logic inside `tokio::spawn` closures.
+Each function has one responsibility. Functions approaching ~50 lines are a signal to review
+decomposition, not a hard limit — the real criterion is single responsibility and screen-readability.
+This applies to async handlers too: extract named helpers rather than nesting logic inside
+`tokio::spawn` closures.
 
 ### 8. Pedantic clippy lints via `[workspace.lints]`
 
-Pedantic and restriction lints are configured at the workspace level in `Cargo.toml` under
-`[workspace.lints]`. CI enforces `cargo clippy -- -D warnings`. This is not optional per-crate
+`clippy::pedantic` is enabled at the workspace level in `Cargo.toml` under
+`[workspace.lints.clippy]`. We do not enable `clippy::restriction` as a group — it contains
+mutually contradictory lints and requires per-lint curation. Instead, individual restriction
+lints may be added to the workspace allow-list on a case-by-case basis when the noise-to-value
+ratio justifies it. CI enforces `cargo clippy -- -D warnings`. This is not optional per-crate
 override territory — all crates inherit the same lint profile.
 
 ---
@@ -81,3 +88,7 @@ override territory — all crates inherit the same lint profile.
   zero `async` in lib code — async I/O wrappers are fine, but they must not embed pure logic.
 - The comment discipline means new contributors must think before writing `// send the message`
   above a `tx.send(...)` call.
+- The short-function heuristic encourages decomposition during code review without blocking
+  legitimate cases (e.g. a long match arm) where splitting would harm readability.
+- The `clippy::pedantic` profile catches a class of real bugs and style issues early; the
+  explicit allow-list in `Cargo.toml` documents every deliberate exception.
