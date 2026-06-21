@@ -19,7 +19,7 @@ Cargo workspace, 4 crates:
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo build -p faultforge-proto      # build a single crate
 ```

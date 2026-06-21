@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    name: Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        # Reads channel (1.96) + components (clippy, rustfmt) from rust-toolchain.toml.
+        # Bundles Swatinem/rust-cache and sets RUSTFLAGS=-D warnings by default.
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace

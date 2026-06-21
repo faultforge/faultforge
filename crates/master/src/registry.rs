@@ -29,6 +29,8 @@ pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime)
         hostname: hostname.clone(),
         last_seen: now,
     };
+    #[allow(clippy::expect_used)]
+    // mutex poison means a previous thread panicked; propagating is correct
     registry
         .lock()
         .expect("registry lock poisoned")
@@ -43,6 +45,8 @@ pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime)
 ///
 /// Panics if the registry mutex is poisoned.
 pub fn update_heartbeat(registry: &Registry, hostname: &Hostname, now: SystemTime) {
+    #[allow(clippy::expect_used)]
+    // mutex poison means a previous thread panicked; propagating is correct
     if let Some(entry) = registry
         .lock()
         .expect("registry lock poisoned")
