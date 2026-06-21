@@ -29,4 +29,4 @@
 ## 5. Verify
 
 - [x] 5.1 Locally confirm green: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build --workspace`, `cargo test --workspace`
-- [ ] 5.2 Push branch / open PR and confirm the workflow runs and goes green; iterate the YAML if the runner differs from local
+- [x] 5.2 Push branch / open PR and confirm the workflow runs and goes green; iterate the YAML if the runner differs from local
