@@ -14,7 +14,12 @@ tracing-subscriber = { workspace = true }
 config = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 
 [lints]
 workspace = true

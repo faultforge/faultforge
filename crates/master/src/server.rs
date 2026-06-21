@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -22,12 +23,14 @@ use crate::registry::{Registry, new_registry, register_agent, update_heartbeat};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    #[error("could not resolve listen_addr '{0}': {1}")]
+    #[error("could not resolve listen address '{0}': {1}")]
     ResolveAddr(String, std::io::Error),
-    #[error("listen_addr resolved to no addresses: {0}")]
+    #[error("listen address resolved to no addresses: {0}")]
     NoAddresses(String),
     #[error("gRPC server failed: {0}")]
     Transport(#[from] tonic::transport::Error),
+    #[error("management API server failed: {0}")]
+    Management(std::io::Error),
 }
 
 // ===== Pure frame-processing functions =====
@@ -184,38 +187,76 @@ impl AgentService for MasterService {
 
 // ===== Server entry point =====
 
-/// Start the gRPC server and serve until the process exits.
+/// Resolve a listen address string to a single `SocketAddr`.
+///
+/// Warns and keeps the first when resolution yields multiple candidates.
 ///
 /// # Errors
 ///
-/// Returns `Err` if the listen address cannot be resolved, resolves to no
-/// addresses, or the gRPC transport layer fails.
-pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
-    let mut addrs = tokio::net::lookup_host(&cfg.listen_addr)
+/// Returns `Err` if the address cannot be resolved or resolves to nothing.
+async fn resolve_addr(addr: &str) -> Result<SocketAddr, ServerError> {
+    let mut addrs = tokio::net::lookup_host(addr)
         .await
-        .map_err(|e| ServerError::ResolveAddr(cfg.listen_addr.clone(), e))?
+        .map_err(|e| ServerError::ResolveAddr(addr.to_string(), e))?
         .peekable();
-    let addr = addrs
+    let resolved = addrs
         .next()
-        .ok_or_else(|| ServerError::NoAddresses(cfg.listen_addr.clone()))?;
+        .ok_or_else(|| ServerError::NoAddresses(addr.to_string()))?;
     // Warn if DNS returned multiple candidates — only the first is used.
     let remaining: Vec<_> = addrs.collect();
     if !remaining.is_empty() {
         warn!(
-            chosen = %addr,
+            chosen = %resolved,
             skipped = ?remaining,
-            "listen_addr resolved to multiple addresses; using the first"
+            "listen address resolved to multiple addresses; using the first"
         );
     }
+    Ok(resolved)
+}
+
+/// Start the gRPC agent plane and the HTTP management API, serving until the
+/// process exits. Both servers share a single agent registry and run
+/// concurrently; a failure of either stops the master.
+///
+/// # Errors
+///
+/// Returns `Err` if either listen address cannot be resolved, resolves to no
+/// addresses, the gRPC transport layer fails, or the management API server
+/// fails to bind or serve.
+pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
+    let grpc_addr = resolve_addr(&cfg.listen_addr).await?;
+    let management_addr = resolve_addr(&cfg.management_listen_addr).await?;
+
+    // Single registry instance shared by both servers (one source of truth).
     let registry = new_registry();
-    let service = MasterService::new(registry, cfg.heartbeat_interval_secs);
+    let service = MasterService::new(Arc::clone(&registry), cfg.heartbeat_interval_secs);
 
-    info!(%addr, "faultforge-master listening");
+    info!(%grpc_addr, "faultforge-master gRPC agent plane listening");
+    info!(%management_addr, "faultforge-master management API listening");
 
-    tonic::transport::Server::builder()
-        .add_service(AgentServiceServer::new(service))
-        .serve(addr)
-        .await?;
+    let grpc = async {
+        tonic::transport::Server::builder()
+            .add_service(AgentServiceServer::new(service))
+            .serve(grpc_addr)
+            .await
+            .map_err(ServerError::from)
+    };
+
+    let management = async {
+        let listener = tokio::net::TcpListener::bind(management_addr)
+            .await
+            .map_err(ServerError::Management)?;
+        axum::serve(
+            listener,
+            crate::management::router(crate::management::ManagementState { registry }),
+        )
+        .await
+        .map_err(ServerError::Management)
+    };
+
+    // try_join! returns on the first error, so a failure of either server
+    // stops the master.
+    tokio::try_join!(grpc, management)?;
 
     Ok(())
 }
