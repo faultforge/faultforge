@@ -183,6 +183,12 @@ impl AgentService for MasterService {
 
 // ===== Server entry point =====
 
+/// Start the gRPC server and serve until the process exits.
+///
+/// # Errors
+///
+/// Returns `Err` if the listen address cannot be resolved, resolves to no
+/// addresses, or the gRPC transport layer fails.
 pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
     let mut addrs = tokio::net::lookup_host(&cfg.listen_addr)
         .await

@@ -19,6 +19,12 @@ pub struct Cli {
     pub heartbeat_interval_secs: Option<u32>,
 }
 
+/// Load master configuration from all sources (file, env, CLI flags).
+///
+/// # Errors
+///
+/// Returns `Err` if the configuration file cannot be read, a value cannot be
+/// parsed, or `heartbeat_interval_secs` is 0.
 pub fn load_config(cli: &Cli) -> Result<MasterConfig, ::config::ConfigError> {
     let mut builder = Config::builder()
         .set_default("listen_addr", "127.0.0.1:50051")?
@@ -37,7 +43,7 @@ pub fn load_config(cli: &Cli) -> Result<MasterConfig, ::config::ConfigError> {
         builder = builder.set_override("listen_addr", addr.as_str())?;
     }
     if let Some(secs) = cli.heartbeat_interval_secs {
-        builder = builder.set_override("heartbeat_interval_secs", secs as i64)?;
+        builder = builder.set_override("heartbeat_interval_secs", i64::from(secs))?;
     }
 
     let cfg: MasterConfig = builder.build()?.try_deserialize()?;

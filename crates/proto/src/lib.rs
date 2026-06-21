@@ -1,8 +1,9 @@
-//! Shared gRPC contract (the "schema") for FaultForge master <-> agent.
+//! Shared gRPC contract (the "schema") for `FaultForge` master <-> agent.
 //!
 //! The protobuf definitions in `proto/faultforge.proto` are compiled by
 //! `build.rs` and included here under [`v1`].
 
+#[allow(clippy::pedantic)]
 pub mod v1 {
     tonic::include_proto!("faultforge.v1");
 }
@@ -13,10 +14,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// The caller supplies the time (e.g. from a `Clock`), so no module reads the
 /// wall clock implicitly.
+///
+/// # Panics
+///
+/// Panics if the system clock is set before the Unix epoch.
+#[must_use]
 pub fn unix_ms(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
+    // ms since epoch fits comfortably in i64 for ~292 million years; the cast is safe.
+    #[allow(clippy::cast_possible_truncation)]
+    let ms = t
+        .duration_since(UNIX_EPOCH)
         .expect("system clock before Unix epoch")
-        .as_millis() as i64
+        .as_millis() as i64;
+    ms
 }
 
 /// Validated, non-empty hostname.
@@ -24,6 +34,11 @@ pub fn unix_ms(t: SystemTime) -> i64 {
 pub struct Hostname(String);
 
 impl Hostname {
+    /// Create a new `Hostname` from a string slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the string is empty or contains only whitespace.
     pub fn new(s: &str) -> Result<Self, &'static str> {
         let s = s.trim();
         if s.is_empty() {
@@ -33,6 +48,7 @@ impl Hostname {
         }
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -46,11 +62,11 @@ impl std::fmt::Display for Hostname {
 
 #[cfg(test)]
 mod tests {
-    use super::{unix_ms, Hostname};
     use super::v1::{
         AgentMessage, Heartbeat, HeartbeatAck, Register, RegisterAck, ServerMessage, agent_message,
         server_message,
     };
+    use super::{Hostname, unix_ms};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

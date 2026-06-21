@@ -18,6 +18,12 @@ pub struct Cli {
     pub master_addr: Option<String>,
 }
 
+/// Load agent configuration from all sources (file, env, CLI flags).
+///
+/// # Errors
+///
+/// Returns `Err` if the configuration file cannot be read, a value cannot be
+/// parsed, or `master_addr` is absent from all sources.
 pub fn load_config(cli: &Cli) -> Result<AgentConfig, config::ConfigError> {
     // master_addr has no default — try_deserialize fails if absent from all sources.
     let mut builder = Config::builder();

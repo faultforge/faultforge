@@ -68,6 +68,13 @@ fn interpret_heartbeat_ack(payload: Option<server_message::Payload>) -> Result<i
 
 // ===== Agent logic =====
 
+/// Connect to the master and run the register/heartbeat loop forever.
+///
+/// # Errors
+///
+/// Returns `Err` if the local hostname cannot be read, the master address is
+/// invalid, the gRPC connection fails, or the session stream is closed
+/// unexpectedly.
 pub async fn run_agent(cfg: AgentConfig) -> Result<(), AgentError> {
     // Read local hostname at startup (no persisted state).
     let raw_hostname = hostname::get()?;

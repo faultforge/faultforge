@@ -25,3 +25,10 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 hostname = "0.4"
 thiserror = "2"
+
+[workspace.lints.rust]
+# future-incompatible and unused lints (already covered by default, but explicit is clearer)
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Curated allow-list — add entries here as needed when pedantic is too noisy

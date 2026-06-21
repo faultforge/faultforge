@@ -1,4 +1,4 @@
-//! FaultForge operator CLI (`faultforge`) — skeleton.
+//! `FaultForge` operator CLI (`faultforge`) — skeleton.
 //!
 //! Future home of the `faultforge agents list/show/rename/rm` subcommands,
 //! which talk to the master's REST API. For now this is a placeholder

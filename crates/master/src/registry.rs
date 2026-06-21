@@ -13,10 +13,16 @@ pub struct AgentInfo {
 
 pub type Registry = Arc<Mutex<HashMap<String, AgentInfo>>>;
 
+#[must_use]
 pub fn new_registry() -> Registry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Register an agent in the registry, replacing any existing entry for the hostname.
+///
+/// # Panics
+///
+/// Panics if the registry mutex is poisoned.
 pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime) {
     let info = AgentInfo {
         name: hostname.to_string(),
@@ -29,6 +35,13 @@ pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime)
         .insert(hostname.to_string(), info);
 }
 
+/// Update the `last_seen` timestamp for a registered agent.
+///
+/// Does nothing if the hostname is not found in the registry.
+///
+/// # Panics
+///
+/// Panics if the registry mutex is poisoned.
 pub fn update_heartbeat(registry: &Registry, hostname: &Hostname, now: SystemTime) {
     if let Some(entry) = registry
         .lock()
