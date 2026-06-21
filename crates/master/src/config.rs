@@ -5,6 +5,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct MasterConfig {
     pub listen_addr: String,
+    pub management_listen_addr: String,
     pub heartbeat_interval_secs: u32,
 }
 
@@ -15,6 +16,8 @@ pub struct Cli {
     pub config: Option<String>,
     #[arg(long)]
     pub listen_addr: Option<String>,
+    #[arg(long)]
+    pub management_listen_addr: Option<String>,
     #[arg(long)]
     pub heartbeat_interval_secs: Option<u32>,
 }
@@ -28,6 +31,7 @@ pub struct Cli {
 pub fn load_config(cli: &Cli) -> Result<MasterConfig, ::config::ConfigError> {
     let mut builder = Config::builder()
         .set_default("listen_addr", "127.0.0.1:50051")?
+        .set_default("management_listen_addr", "127.0.0.1:8069")?
         .set_default("heartbeat_interval_secs", 5_i64)?;
 
     builder = builder.add_source(
@@ -41,6 +45,9 @@ pub fn load_config(cli: &Cli) -> Result<MasterConfig, ::config::ConfigError> {
 
     if let Some(addr) = &cli.listen_addr {
         builder = builder.set_override("listen_addr", addr.as_str())?;
+    }
+    if let Some(addr) = &cli.management_listen_addr {
+        builder = builder.set_override("management_listen_addr", addr.as_str())?;
     }
     if let Some(secs) = cli.heartbeat_interval_secs {
         builder = builder.set_override("heartbeat_interval_secs", i64::from(secs))?;
@@ -64,6 +71,8 @@ mod tests {
         let cfg: MasterConfig = Config::builder()
             .set_default("listen_addr", "127.0.0.1:50051")
             .unwrap()
+            .set_default("management_listen_addr", "127.0.0.1:8069")
+            .unwrap()
             .set_default("heartbeat_interval_secs", 5_i64)
             .unwrap()
             .build()
@@ -71,6 +80,7 @@ mod tests {
             .try_deserialize()
             .unwrap();
         assert_eq!(cfg.listen_addr, "127.0.0.1:50051");
+        assert_eq!(cfg.management_listen_addr, "127.0.0.1:8069");
         assert_eq!(cfg.heartbeat_interval_secs, 5);
     }
 
@@ -79,9 +89,13 @@ mod tests {
         let cfg: MasterConfig = Config::builder()
             .set_default("listen_addr", "127.0.0.1:50051")
             .unwrap()
+            .set_default("management_listen_addr", "127.0.0.1:8069")
+            .unwrap()
             .set_default("heartbeat_interval_secs", 5_i64)
             .unwrap()
             .set_override("listen_addr", "0.0.0.0:9090")
+            .unwrap()
+            .set_override("management_listen_addr", "0.0.0.0:9091")
             .unwrap()
             .set_override("heartbeat_interval_secs", 30_i64)
             .unwrap()
@@ -90,6 +104,7 @@ mod tests {
             .try_deserialize()
             .unwrap();
         assert_eq!(cfg.listen_addr, "0.0.0.0:9090");
+        assert_eq!(cfg.management_listen_addr, "0.0.0.0:9091");
         assert_eq!(cfg.heartbeat_interval_secs, 30);
     }
 
@@ -98,6 +113,7 @@ mod tests {
         let cli = Cli {
             config: None,
             listen_addr: None,
+            management_listen_addr: None,
             heartbeat_interval_secs: Some(0),
         };
         let err = load_config(&cli).unwrap_err();

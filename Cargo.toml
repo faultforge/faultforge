@@ -20,9 +20,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-config = "0.14"
+config = "0.15.24"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
 hostname = "0.4"
 thiserror = "2"
 
