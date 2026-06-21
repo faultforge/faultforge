@@ -87,6 +87,19 @@ impl MasterService {
             clock: Arc::new(SystemClock),
         }
     }
+
+    /// Constructor for tests or custom deployments that need a specific clock.
+    pub fn with_clock(
+        registry: Registry,
+        heartbeat_interval_secs: u32,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            registry,
+            heartbeat_interval_secs,
+            clock,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -136,9 +149,10 @@ impl AgentService for MasterService {
                             let now = clock.now();
                             match process_heartbeat(hostname.as_ref(), now) {
                                 Ok(reply) => {
-                                    let h = hostname.as_ref().unwrap();
-                                    update_heartbeat(&registry, h, now);
-                                    info!(hostname = %h, "heartbeat");
+                                    if let Some(h) = &hostname {
+                                        update_heartbeat(&registry, h, now);
+                                        info!(hostname = %h, "heartbeat");
+                                    }
                                     if tx.send(Ok(reply)).await.is_err() {
                                         break;
                                     }
