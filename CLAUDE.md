@@ -28,8 +28,7 @@ No system `protoc` needed — `crates/proto/build.rs` points `tonic-prost-build`
 binary (`protoc-bin-vendored`).
 
 ## Coding standards
-
-See [CONVENTIONS.md](CONVENTIONS.md) for rules and snippets.  
+Before writing or modifying any Rust, read [CONVENTIONS.md](CONVENTIONS.md) and follow it. Treat its rules as mandatory, not advisory
 Rationale: [docs/adr/0001-coding-standards.md](docs/adr/0001-coding-standards.md).
 
 ## Architecture (slice 1 — register + heartbeat)
