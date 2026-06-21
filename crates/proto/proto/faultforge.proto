@@ -1,0 +1,36 @@
+syntax = "proto3";
+package faultforge.v1;
+
+// One long-lived bidi stream: agent dials in, master pushes down.
+service AgentService {
+  rpc Session(stream AgentMessage) returns (stream ServerMessage);
+}
+
+message AgentMessage {
+  oneof payload {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message Register {
+  string hostname = 1;
+}
+
+message Heartbeat {}
+
+message ServerMessage {
+  oneof payload {
+    RegisterAck register_ack = 1;
+    HeartbeatAck heartbeat_ack = 2;
+  }
+}
+
+message RegisterAck {
+  int64 server_time_unix_ms = 1;
+  uint32 heartbeat_interval_secs = 2;
+}
+
+message HeartbeatAck {
+  int64 server_time_unix_ms = 1;
+}

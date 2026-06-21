@@ -1,0 +1,18 @@
+[package]
+name = "faultforge-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[lints]
+workspace = true

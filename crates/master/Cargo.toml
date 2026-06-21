@@ -1,0 +1,20 @@
+[package]
+name = "faultforge-master"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+faultforge-proto = { path = "../proto" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = [ "crates/agent", "crates/cli", "crates/master","crates/proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Pinned versions of the shared gRPC stack. The whole tonic/prost set moves
+# together; bump them as a group only after a matching toolchain upgrade.
+[workspace.dependencies]
+prost = "0.14"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3.2.0"
+
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+config = "0.14"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+hostname = "0.4"
+thiserror = "2"
+
+[workspace.lints.rust]
+# future-incompatible and unused lints (already covered by default, but explicit is clearer)
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Curated allow-list — add entries here as needed when pedantic is too noisy
