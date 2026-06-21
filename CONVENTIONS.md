@@ -148,9 +148,15 @@ boundary; trust the type everywhere inside.
 // Good
 pub struct Hostname(String);
 
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum HostnameError {
+    #[error("hostname must not be empty")]
+    Empty,
+}
+
 impl Hostname {
     /// Parses and validates a hostname string.
-    pub fn parse(s: impl Into<String>) -> Result<Self, HostnameError> { ... }
+    pub fn parse(s: &str) -> Result<Self, HostnameError> { ... }
 }
 
 fn register(hostname: Hostname) { ... } // can't accidentally pass a listen addr

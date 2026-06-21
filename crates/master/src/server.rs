@@ -44,7 +44,7 @@ fn process_register(
             "duplicate register on active session",
         ));
     }
-    let hostname = Hostname::new(hostname_str).map_err(Status::invalid_argument)?;
+    let hostname = Hostname::parse(hostname_str).map_err(|e| Status::invalid_argument(e.to_string()))?;
     let reply = ServerMessage {
         payload: Some(server_message::Payload::RegisterAck(RegisterAck {
             server_time_unix_ms: unix_ms(now),
@@ -178,6 +178,83 @@ impl AgentService for MasterService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+// ===== Unit tests =====
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::Clock;
+    use crate::registry::new_registry;
+    use faultforge_proto::v1::{server_message};
+    use faultforge_proto::Hostname;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct FixedClock(SystemTime);
+    impl Clock for FixedClock {
+        fn now(&self) -> SystemTime {
+            self.0
+        }
+    }
+
+    #[test]
+    fn with_clock_accepts_custom_clock() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let registry = new_registry();
+        let _service = MasterService::with_clock(registry, 5, std::sync::Arc::new(FixedClock(t)));
+    }
+
+    #[test]
+    fn process_register_rejects_empty_hostname() {
+        let t = UNIX_EPOCH + Duration::from_secs(1000);
+        let result = process_register("", false, t, 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_register_rejects_duplicate() {
+        let t = UNIX_EPOCH + Duration::from_secs(1000);
+        let result = process_register("web-01", true, t, 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_register_success() {
+        let t = UNIX_EPOCH + Duration::from_secs(1000);
+        let result = process_register("web-01", false, t, 5);
+        assert!(result.is_ok());
+        let (hostname, msg) = result.unwrap();
+        assert_eq!(hostname.as_str(), "web-01");
+        match msg.payload {
+            Some(server_message::Payload::RegisterAck(ack)) => {
+                assert_eq!(ack.heartbeat_interval_secs, 5);
+                assert_eq!(ack.server_time_unix_ms, faultforge_proto::unix_ms(t));
+            }
+            _ => panic!("expected RegisterAck"),
+        }
+    }
+
+    #[test]
+    fn process_heartbeat_before_register_fails() {
+        let t = UNIX_EPOCH + Duration::from_secs(1000);
+        let result = process_heartbeat(None, t);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn process_heartbeat_success() {
+        let t = UNIX_EPOCH + Duration::from_secs(1000);
+        let hostname = Hostname::parse("web-01").unwrap();
+        let result = process_heartbeat(Some(&hostname), t);
+        assert!(result.is_ok());
+        match result.unwrap().payload {
+            Some(server_message::Payload::HeartbeatAck(ack)) => {
+                assert_eq!(ack.server_time_unix_ms, faultforge_proto::unix_ms(t));
+            }
+            _ => panic!("expected HeartbeatAck"),
+        }
     }
 }
 

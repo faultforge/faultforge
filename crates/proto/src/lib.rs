@@ -29,20 +29,28 @@ pub fn unix_ms(t: SystemTime) -> i64 {
     ms
 }
 
+/// Error type returned by [`Hostname::parse`].
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum HostnameError {
+    /// The supplied string was empty or contained only whitespace.
+    #[error("hostname must not be empty")]
+    Empty,
+}
+
 /// Validated, non-empty hostname.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hostname(String);
 
 impl Hostname {
-    /// Create a new `Hostname` from a string slice.
+    /// Parse and validate a hostname string.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the string is empty or contains only whitespace.
-    pub fn new(s: &str) -> Result<Self, &'static str> {
+    /// Returns [`HostnameError::Empty`] if the string is empty or contains only whitespace.
+    pub fn parse(s: &str) -> Result<Self, HostnameError> {
         let s = s.trim();
         if s.is_empty() {
-            Err("hostname must not be empty")
+            Err(HostnameError::Empty)
         } else {
             Ok(Self(s.to_string()))
         }
@@ -145,24 +153,24 @@ mod tests {
 
     #[test]
     fn hostname_empty_string_is_err() {
-        assert!(Hostname::new("").is_err());
+        assert!(Hostname::parse("").is_err());
     }
 
     #[test]
     fn hostname_whitespace_only_is_err() {
-        assert!(Hostname::new("   ").is_err());
+        assert!(Hostname::parse("   ").is_err());
     }
 
     #[test]
     fn hostname_valid_is_ok() {
-        let h = Hostname::new("web-01").expect("valid hostname");
+        let h = Hostname::parse("web-01").expect("valid hostname");
         assert_eq!(h.as_str(), "web-01");
         assert_eq!(h.to_string(), "web-01");
     }
 
     #[test]
     fn hostname_trims_whitespace() {
-        let h = Hostname::new("  web-01  ").expect("valid hostname with surrounding whitespace");
+        let h = Hostname::parse("  web-01  ").expect("valid hostname with surrounding whitespace");
         assert_eq!(h.as_str(), "web-01");
     }
 }

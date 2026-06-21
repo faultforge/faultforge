@@ -79,7 +79,7 @@ pub async fn run_agent(cfg: AgentConfig) -> Result<(), AgentError> {
     // Read local hostname at startup (no persisted state).
     let raw_hostname = hostname::get()?;
     let hostname =
-        Hostname::new(&raw_hostname.to_string_lossy()).map_err(|_| AgentError::EmptyHostname)?;
+        Hostname::parse(&raw_hostname.to_string_lossy()).map_err(|_| AgentError::EmptyHostname)?;
 
     let master_addr = normalize_master_addr(&cfg.master_addr);
 

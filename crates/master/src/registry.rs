@@ -59,7 +59,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     fn hostname(s: &str) -> Hostname {
-        Hostname::new(s).unwrap()
+        Hostname::parse(s).unwrap()
     }
 
     #[test]

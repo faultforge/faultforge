@@ -8,6 +8,7 @@ license.workspace = true
 prost = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+thiserror = { workspace = true }
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }
