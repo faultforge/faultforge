@@ -31,6 +31,8 @@ fn check_stale(entry: &ConnInfo) -> bool {
 
 Pure functions receive `now: SystemTime` as a parameter. Call `SystemTime::now()` only inside
 the IO shell (e.g. in a `tokio::spawn` task or `main`). Tests pass a fixed value.
+A `Clock` trait is reserved for the IO shell where code genuinely must read the current time;
+tests inject a fake one.
 
 ```rust
 // Good — caller supplies the time; test passes a fixed value
@@ -55,12 +57,13 @@ Separate "compute what should happen" from "do it". The pure core may not be `as
 belongs only to I/O wrappers.
 
 ```rust
-// Good — compute effect, apply it outside
+// Good — pure sync function; called by the async shell, not async itself
 fn next_state(state: AgentState, event: Event) -> (AgentState, Option<Effect>) { ... }
 
-// Bad — async computation mixed with pure logic
+// Bad — async crept in because one call site needed it; now the whole
+//       state machine is infected and can't be tested without a runtime
 async fn next_state(state: AgentState, event: Event) -> AgentState {
-    tokio::time::sleep(Duration::from_secs(1)).await; // why is this here?
+    self.db.load_flags().await?; // pulled into pure logic; now untestable
     ...
 }
 ```
@@ -189,11 +192,15 @@ One clear responsibility per file. Do not let pure domain types leak into `serve
 versa.
 
 ```rust
-// Good — clean module boundary
-// master/src/registry.rs — pure: HashMap logic, stale checks
-// master/src/session.rs  — IO: reads stream, calls registry functions
+// Good — IO shell calls into the pure registry; registry knows nothing about gRPC
+// session.rs
+pub async fn run(mut stream: SessionStream, registry: Arc<Mutex<Registry>>) {
+    let event = stream.recv().await;
+    registry.lock().unwrap().apply(event, SystemTime::now());
+}
 
-// Bad — gRPC stream handling mixed into the registry type
+// Bad — gRPC stream handling mixed into the registry type; breaks the layer boundary
+// registry.rs
 impl Registry {
     pub async fn handle_stream(&self, stream: SessionStream) { ... }
 }
