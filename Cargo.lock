@@ -377,6 +377,7 @@ dependencies = [
  "faultforge-proto",
  "hostname",
  "serde",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tonic",
