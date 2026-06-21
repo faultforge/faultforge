@@ -32,3 +32,6 @@ thiserror = "2"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Curated allow-list — add entries here as needed when pedantic is too noisy
+# Convention #6: no unwrap/expect outside tests; test code carries cfg_attr(test, allow(...))
+unwrap_used = "warn"
+expect_used = "warn"

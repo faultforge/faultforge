@@ -47,7 +47,7 @@ pub fn load_config(cli: &Cli) -> Result<MasterConfig, ::config::ConfigError> {
     }
 
     let cfg: MasterConfig = builder.build()?.try_deserialize()?;
-    if cfg.heartbeat_interval_secs <= 0 {
+    if cfg.heartbeat_interval_secs == 0 {
         return Err(::config::ConfigError::Message(
             "heartbeat_interval_secs must be greater than 0".into(),
         ));

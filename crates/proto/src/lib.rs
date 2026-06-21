@@ -3,6 +3,8 @@
 //! The protobuf definitions in `proto/faultforge.proto` are compiled by
 //! `build.rs` and included here under [`v1`].
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 #[allow(clippy::pedantic)]
 pub mod v1 {
     tonic::include_proto!("faultforge.v1");
@@ -22,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn unix_ms(t: SystemTime) -> i64 {
     // ms since epoch fits comfortably in i64 for ~292 million years; the cast is safe.
     #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::expect_used)] // panics only if the system clock predates the Unix epoch
     let ms = t
         .duration_since(UNIX_EPOCH)
         .expect("system clock before Unix epoch")

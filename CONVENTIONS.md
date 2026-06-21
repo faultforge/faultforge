@@ -107,7 +107,14 @@ fn handle_registration(raw: RawConfig, s: &str, metrics: &Metrics) -> Result<...
 
 ---
 
-## 6. Typed errors
+## 6. Typed errors — and no `unwrap`/`expect` outside tests
+
+> **CI-enforced:** `clippy::unwrap_used` and `clippy::expect_used` are enabled workspace-wide.
+> Test code is exempt via `#![cfg_attr(test, allow(...))]`. Production `expect` sites must
+> carry a per-site `#[allow(clippy::expect_used)]` with a comment explaining why the panic is
+> impossible.
+
+
 
 `thiserror` in library crates; `anyhow` only at binary entry points (`main` / `run_*`). No
 `unwrap()` or `expect()` outside tests and provably-impossible cases — when `expect` is used,

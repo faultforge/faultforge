@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 
 use faultforge_master::{MasterService, Registry, new_registry};
@@ -243,7 +245,7 @@ async fn register_with_empty_hostname_is_rejected() {
 
     tx.send(AgentMessage {
         payload: Some(agent_message::Payload::Register(Register {
-            hostname: "".to_string(),
+            hostname: String::new(),
         })),
     })
     .await

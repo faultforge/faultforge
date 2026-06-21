@@ -44,7 +44,8 @@ fn process_register(
             "duplicate register on active session",
         ));
     }
-    let hostname = Hostname::parse(hostname_str).map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let hostname =
+        Hostname::parse(hostname_str).map_err(|e| Status::invalid_argument(e.to_string()))?;
     let reply = ServerMessage {
         payload: Some(server_message::Payload::RegisterAck(RegisterAck {
             server_time_unix_ms: unix_ms(now),
@@ -181,6 +182,44 @@ impl AgentService for MasterService {
     }
 }
 
+// ===== Server entry point =====
+
+/// Start the gRPC server and serve until the process exits.
+///
+/// # Errors
+///
+/// Returns `Err` if the listen address cannot be resolved, resolves to no
+/// addresses, or the gRPC transport layer fails.
+pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
+    let mut addrs = tokio::net::lookup_host(&cfg.listen_addr)
+        .await
+        .map_err(|e| ServerError::ResolveAddr(cfg.listen_addr.clone(), e))?
+        .peekable();
+    let addr = addrs
+        .next()
+        .ok_or_else(|| ServerError::NoAddresses(cfg.listen_addr.clone()))?;
+    // Warn if DNS returned multiple candidates — only the first is used.
+    let remaining: Vec<_> = addrs.collect();
+    if !remaining.is_empty() {
+        warn!(
+            chosen = %addr,
+            skipped = ?remaining,
+            "listen_addr resolved to multiple addresses; using the first"
+        );
+    }
+    let registry = new_registry();
+    let service = MasterService::new(registry, cfg.heartbeat_interval_secs);
+
+    info!(%addr, "faultforge-master listening");
+
+    tonic::transport::Server::builder()
+        .add_service(AgentServiceServer::new(service))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+
 // ===== Unit tests =====
 
 #[cfg(test)]
@@ -188,8 +227,8 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::registry::new_registry;
-    use faultforge_proto::v1::{server_message};
     use faultforge_proto::Hostname;
+    use faultforge_proto::v1::server_message;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct FixedClock(SystemTime);
@@ -256,42 +295,4 @@ mod tests {
             _ => panic!("expected HeartbeatAck"),
         }
     }
-}
-
-// ===== Server entry point =====
-
-/// Start the gRPC server and serve until the process exits.
-///
-/// # Errors
-///
-/// Returns `Err` if the listen address cannot be resolved, resolves to no
-/// addresses, or the gRPC transport layer fails.
-pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
-    let mut addrs = tokio::net::lookup_host(&cfg.listen_addr)
-        .await
-        .map_err(|e| ServerError::ResolveAddr(cfg.listen_addr.clone(), e))?
-        .peekable();
-    let addr = addrs
-        .next()
-        .ok_or_else(|| ServerError::NoAddresses(cfg.listen_addr.clone()))?;
-    // Warn if DNS returned multiple candidates — only the first is used.
-    let remaining: Vec<_> = addrs.collect();
-    if !remaining.is_empty() {
-        warn!(
-            chosen = %addr,
-            skipped = ?remaining,
-            "listen_addr resolved to multiple addresses; using the first"
-        );
-    }
-    let registry = new_registry();
-    let service = MasterService::new(registry, cfg.heartbeat_interval_secs);
-
-    info!(%addr, "faultforge-master listening");
-
-    tonic::transport::Server::builder()
-        .add_service(AgentServiceServer::new(service))
-        .serve(addr)
-        .await?;
-
-    Ok(())
 }
