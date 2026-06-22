@@ -6,17 +6,16 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](rust-toolchain.toml)
 
-FaultForge is a control plane for deliberately injecting failures into fleets of
-bare-metal hosts, so you can find out how your systems break **on your terms** —
-not at 3 a.m. in production.
+FaultForge lets you inject failures into your bare-metal hosts on purpose, so you
+learn how your systems break **on your terms** — not at 3 a.m. in production.
 
-A central **master** coordinates lightweight **agents** running on your target
-hosts. Agents dial home over a single long-lived gRPC stream (NAT/firewall
-friendly), and an operator drives the fleet from the `faultforge` CLI.
+A central **master** controls small **agents** that run on your hosts. Each agent
+dials the master and keeps one long-lived gRPC stream open (so it works through
+NAT and firewalls). You drive the whole fleet from the `faultforge` CLI.
 
 > [!NOTE]
-> FaultForge is in early development. The current slice implements agent
-> registration and heartbeating; fault injection is on the roadmap.
+> FaultForge is still early. Right now agents can register and send heartbeats;
+> fault injection is coming next.
 
 ## Architecture
 
@@ -40,8 +39,9 @@ friendly), and an operator drives the fleet from the `faultforge` CLI.
 
 ## Quick start
 
-Requires a [Rust](https://rustup.rs) toolchain (pinned in `rust-toolchain.toml`).
-No system `protoc` is needed — the protobuf compiler is vendored.
+You need a [Rust](https://rustup.rs) toolchain (the version is pinned in
+`rust-toolchain.toml`). You do **not** need to install `protoc` — it ships with
+the project.
 
 ```bash
 cargo build --workspace
@@ -59,7 +59,7 @@ cargo run -p faultforge-master
 cargo run -p faultforge-agent -- --master-addr http://master-host:50051
 ```
 
-**3. Inspect the fleet** with the CLI:
+**3. Look at the fleet** with the CLI:
 
 ```bash
 # One-shot, scriptable
@@ -79,8 +79,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Coding standards live in [CONVENTIONS.md](CONVENTIONS.md) and are mandatory for
-contributions;
+Please follow the coding standards in [CONVENTIONS.md](CONVENTIONS.md).
 
 ## License
 
