@@ -12,7 +12,7 @@ Cargo workspace, 4 crates:
 | `crates/proto` | — | **built** | Shared gRPC contract; `build.rs` compiles `proto/faultforge.proto` |
 | `crates/master` | `faultforge-master` | **built (slice 1)** | gRPC server, in-memory hostname registry, layered config |
 | `crates/agent` | `faultforge-agent` | **built (slice 1)** | Dials master, register/heartbeat loop, layered config |
-| `crates/cli` | `faultforge` | skeleton | Operator CLI over the master REST API |
+| `crates/cli` | `faultforge` | **built** | Operator CLI — one-shot scripting (`agents list/show`) + interactive TUI |
 
 ## Commands
 
@@ -79,3 +79,8 @@ Agent: `master_addr` is **required** — startup fails if absent from all source
 - **Supersede on reconnect (in-memory only):** a new `Register` for an existing hostname
   replaces the registry entry (`HashMap::insert`). The first stream's task continues running
   until it closes naturally — the master does not actively cancel it in this slice.
+- **CLI config is a single flag, not layered.** `faultforge --master-url <url>` is the only
+  configuration mechanism for the CLI — there is no config file, no `FAULTFORGE_` env var
+  layering, and no `--config` flag. This is intentional: the CLI has exactly one value to
+  configure (the master URL), and the layering ceremony of master/agent is not worth adding for
+  one field. Config-file/env layering can be added later without changing the URL semantics.
