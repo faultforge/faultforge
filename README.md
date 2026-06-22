@@ -63,9 +63,9 @@ cargo run -p faultforge-agent -- --master-addr http://master-host:50051
 
 ```bash
 # One-shot, scriptable
-faultforge agents list
-faultforge agents show <hostname>
-faultforge -o table agents list      # human-readable output
+faultforge --master-url http://master-host:8069 agents list
+faultforge --master-url http://master-host:8069 agents show <hostname>
+faultforge --master-url http://master-host:8069 -o table agents list      # human-readable output
 
 # Or launch the interactive TUI (no subcommand, on a TTY)
 faultforge
