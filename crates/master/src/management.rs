@@ -17,7 +17,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use faultforge_proto::unix_ms;
+use faultforge_proto::{Hostname, unix_ms};
 
 use crate::registry::{AgentInfo, Registry};
 
@@ -66,11 +66,15 @@ async fn list_agents(State(state): State<ManagementState>) -> Json<Vec<AgentView
 }
 
 /// `GET /agents/{hostname}` — fetch one agent, or `404` when no entry exists.
+///
+/// The path segment is parsed into a [`Hostname`] before lookup, so a malformed
+/// (e.g. blank) hostname yields `404` rather than ever matching a stored key.
 #[allow(clippy::needless_pass_by_value)] // axum requires extractors taken by value
 async fn get_agent(
     State(state): State<ManagementState>,
     Path(hostname): Path<String>,
 ) -> Result<Json<AgentView>, StatusCode> {
+    let hostname = Hostname::parse(&hostname).map_err(|_| StatusCode::NOT_FOUND)?;
     #[allow(clippy::expect_used)]
     // mutex poison means a previous thread panicked; propagating is correct
     let view = state

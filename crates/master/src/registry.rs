@@ -11,7 +11,7 @@ pub struct AgentInfo {
     pub last_seen: SystemTime,
 }
 
-pub type Registry = Arc<Mutex<HashMap<String, AgentInfo>>>;
+pub type Registry = Arc<Mutex<HashMap<Hostname, AgentInfo>>>;
 
 #[must_use]
 pub fn new_registry() -> Registry {
@@ -34,7 +34,7 @@ pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime)
     registry
         .lock()
         .expect("registry lock poisoned")
-        .insert(hostname.to_string(), info);
+        .insert(hostname.clone(), info);
 }
 
 /// Update the `last_seen` timestamp for a registered agent.
@@ -50,7 +50,7 @@ pub fn update_heartbeat(registry: &Registry, hostname: &Hostname, now: SystemTim
     if let Some(entry) = registry
         .lock()
         .expect("registry lock poisoned")
-        .get_mut(hostname.as_str())
+        .get_mut(hostname)
     {
         entry.last_seen = now;
     }
@@ -72,7 +72,7 @@ mod tests {
         let t = UNIX_EPOCH + Duration::from_secs(1000);
         register_agent(&registry, &hostname("web-01"), t);
         let reg = registry.lock().unwrap();
-        let entry = reg.get("web-01").unwrap();
+        let entry = reg.get(&hostname("web-01")).unwrap();
         assert_eq!(entry.name, "web-01");
         assert_eq!(entry.last_seen, t);
     }
@@ -86,7 +86,7 @@ mod tests {
         register_agent(&registry, &hostname("web-01"), t2);
         let reg = registry.lock().unwrap();
         assert_eq!(reg.len(), 1);
-        assert_eq!(reg["web-01"].last_seen, t2);
+        assert_eq!(reg[&hostname("web-01")].last_seen, t2);
     }
 
     #[test]
@@ -96,6 +96,6 @@ mod tests {
         let t2 = UNIX_EPOCH + Duration::from_secs(2000);
         register_agent(&registry, &hostname("web-01"), t1);
         update_heartbeat(&registry, &hostname("web-01"), t2);
-        assert_eq!(registry.lock().unwrap()["web-01"].last_seen, t2);
+        assert_eq!(registry.lock().unwrap()[&hostname("web-01")].last_seen, t2);
     }
 }
