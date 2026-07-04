@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 faultforge-proto = { path = "../proto" }
+faultforge-fault = { path = "../fault", features = ["proto"] }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -14,8 +15,16 @@ tracing-subscriber = { workspace = true }
 config = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 hostname = { workspace = true }
 thiserror = { workspace = true }
+# RFC3339 timestamps for agent-authored NDJSON log events (stderr / malformed lines).
+humantime = { workspace = true }
+# Atomic journal/taint writes (temp file + rename), same pattern as noop-marker.
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

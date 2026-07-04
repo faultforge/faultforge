@@ -3,8 +3,8 @@
 //! lifecycle states, integrity digest, and on-disk catalog layout.
 //!
 //! The crate is sync and free of tonic/tokio so plugin binaries stay lean;
-//! `proto ⇄ domain` conversions land behind a `proto` feature flag on this crate
-//! (change 2), so `noop-marker` never links the gRPC stack.
+//! `proto ⇄ domain` conversions live behind the `proto` feature flag ([`proto`]),
+//! so `noop-marker` never links the gRPC stack.
 //!
 //! # Module map
 //!
@@ -21,6 +21,8 @@ pub mod catalog;
 pub mod digest;
 pub mod manifest;
 pub mod params;
+#[cfg(feature = "proto")]
+pub mod proto;
 pub mod protocol;
 pub mod state;
 

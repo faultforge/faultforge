@@ -42,6 +42,10 @@ message InstanceStatus {
   InstanceState state = 2;
   int64 ts_unix_ms = 3;
   string reason = 4; // optional, may be empty
+  // The digest the agent verified for this instance's plugin, so reconciliation
+  // and audit tie the reported state to exact plugin bytes. Empty only when the
+  // instance never resolved a plugin (e.g. rejected before catalog lookup).
+  string plugin_digest = 5;
 }
 
 // A reconciliation snapshot: the current status of each instance the agent

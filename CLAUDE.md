@@ -9,18 +9,22 @@ Cargo workspace, 6 crates:
 
 | Crate | Bin | Status | Role |
 |-------|-----|--------|------|
-| `crates/proto` | — | **built** | Shared gRPC contract; `build.rs` compiles `proto/faultforge.proto`. Carries the fault wire schema (`RunFault`/`AbortFault`, `FaultEvent`/`InstanceStatus`/`InstanceReport`/`TaintStatus`, `InstanceState`) — **contract-only, no behaviour yet** (see below) |
-| `crates/fault` | — | **built** | Shared fault contract (`faultforge-fault`): manifest parsing/validation, params schema, agent↔plugin invocation protocol (stdin JSON, NDJSON events, exit-code table), lifecycle states, sha256 digest, catalog layout. Sync, no tonic/tokio |
+| `crates/proto` | — | **built** | Shared gRPC contract; `build.rs` compiles `proto/faultforge.proto`. Carries the fault wire schema (`RunFault`/`AbortFault`, `FaultEvent`/`InstanceStatus`/`InstanceReport`/`TaintStatus`, `InstanceState`) |
+| `crates/fault` | — | **built** | Shared fault contract (`faultforge-fault`): manifest parsing/validation, params schema, agent↔plugin invocation protocol (stdin JSON, NDJSON events, exit-code table), lifecycle states, sha256 digest, catalog layout. Sync, no tonic/tokio; the optional `proto` feature adds domain⇄wire `InstanceState` conversions (agent/master only — plugin binaries never enable it) |
 | `crates/master` | `faultforge-master` | **built (slice 1)** | Two planes over one registry: gRPC agent server + read-only HTTP management API; in-memory hostname registry, layered config |
-| `crates/agent` | `faultforge-agent` | **built (slice 1)** | Dials master, register/heartbeat loop, layered config |
+| `crates/agent` | `faultforge-agent` | **built (slice 2)** | Dials master with reconnect+backoff, register/heartbeat, and the **fault runtime**: executes fault instances from the on-disk catalog with a journal, safety timers, and taint quarantine |
 | `crates/cli` | `faultforge` | **built** | Operator CLI — one-shot scripting (`agents list/show`) + interactive TUI |
 | `crates/plugins/noop-marker` | `noop-marker` | **built** | Reference fault plugin: zero-blast-radius fault whose only effect is a marker file's existence. Proves the `faultforge-fault` contract with golden tests |
 
-**Fault schema is contract-only.** The fault wire frames and the `faultforge-fault` crate define the
-contract and are proven by `noop-marker`, but nothing executes faults yet: the agent does not run
-plugins and the master does not dispatch. Both session planes gain log-and-continue arms for the new
-oneof variants (an endpoint receiving an unhandled fault frame logs it and keeps the stream open) but
-neither changes behaviour. Fault execution arrives in the `agent-fault-runtime` change.
+**The agent executes faults; the master does not dispatch yet.** The `agent-fault-runtime` change
+gave the agent the full instance lifecycle: `RunFault`/`AbortFault` handling, a pure per-instance
+state machine (`crates/agent/src/machine.rs`), digest verification before *every* plugin
+invocation, two-phase preflight, an instance journal with restart replay, the one-timer safety
+triad (duration stop / master-loss self-abort / dead-man), and persistent `TAINTED` quarantine.
+The master still only logs the agent's fault frames — dispatch, experiment records, and
+management-plane writes arrive in `master-fault-dispatch`. Until then the only way to drive the
+runtime is a gRPC client speaking the `Session` stream (see the fake master in
+`crates/agent/tests/runtime.rs`).
 
 ## Commands
 
@@ -61,17 +65,37 @@ that narrates what the next lines do — the code should be self-explanatory; if
 code, don't annotate it. `///` doc-comments on public items are the exception: they are required API
 documentation and are kept.
 
-## Architecture (slice 1 — register + heartbeat)
+## Architecture
 
 Agent **dials** the master and holds **one persistent bidirectional gRPC `Session` stream**.
-The stream is used for both registration (first frame) and periodic heartbeats. This works
-through NAT/firewalls and is the same channel future fault-injection commands will use.
+The stream carries registration (first frame), periodic heartbeats, and all fault control and
+telemetry frames. This works through NAT/firewalls. Since `agent-fault-runtime` the session is
+**full-duplex and self-healing**: a reader dispatches inbound frames, a writer drains one shared
+outbound channel, and the whole connect→register→pump lifecycle sits in a reconnect loop with
+exponential backoff (1s→30s cap, retries forever). Every successful registration is followed by
+the reconciliation sequence: `InstanceReport` (live instances; empty is meaningful),
+`TaintStatus` (both values), then any queued replay outcomes.
+
+**Agent fault runtime (slice 2).** Functional core / imperative shell throughout:
+- `machine.rs` — the pure per-instance state machine `step(state, event) -> (state, effects)`
+  plus the pure one-deadline function (`min` of duration end / master-loss threshold / dead-man).
+  All ADR-0002 ordering rules (retry-cleanup-once-then-taint, dead-man dominance, two-track
+  telemetry) live here as table-tested transitions.
+- `supervisor.rs` — one tokio task per instance executes effects: digest-gated plugin
+  invocations (re-verified before **every** spawn, including replay), journal writes, status
+  emission. Duplicate `RunFault` ids are dropped (inject is never re-issued). Restart replay
+  recovers journaled instances (`abort`+`cleanup`) *before* the first connect: `ABORTED` if
+  before `deadline_unix`, `ERROR` past it.
+- `runner.rs` — sync process shell: stdin JSON + EOF, NDJSON stdout split, stderr capture, hard
+  invocation timeout (default 60s) with kill.
+- `journal.rs` / `taint.rs` — atomic (temp+rename) versioned records under `data_dir`; the taint
+  file fails closed (unreadable = tainted) and is never removed by the agent.
 
 **Current state: single in-memory registry, no persistence.**
 The master keeps `Registry = Arc<Mutex<HashMap<Hostname, AgentInfo>>>` where `AgentInfo
 { hostname, name, last_seen }` (`crates/master/src/registry.rs`). There is no SQLite store or
-staleness sweep in this slice. On master restart the registry is empty; since agents don't
-reconnect in this slice they must be restarted too.
+staleness sweep in this slice. On master restart the registry is empty; agents reconnect and
+re-register on their own.
 
 **Two planes over one registry.** The master runs two independent listeners sharing the same
 `Registry` handle:
@@ -108,7 +132,10 @@ Both binaries use layered sources (lowest → highest priority):
 
 Master defaults: `listen_addr = 127.0.0.1:50051`, `management_listen_addr = 127.0.0.1:8069`,
 `heartbeat_interval_secs = 5`.
-Agent: `master_addr` is **required** — startup fails if absent from all sources.
+Agent: `master_addr` is **required** — startup fails if absent from all sources. Runtime keys
+(all defaulted): `plugin_root = /usr/lib/faultforge/plugins`, `data_dir = /var/lib/faultforge`,
+`master_loss_threshold_secs = 30`, `invocation_timeout_secs = 60` (env/file only, no CLI flag).
+Running as non-root in dev requires pointing `data_dir` at a writable path.
 
 ## Gotchas
 
@@ -121,6 +148,21 @@ Agent: `master_addr` is **required** — startup fails if absent from all source
 - **Supersede on reconnect (in-memory only):** a new `Register` for an existing hostname
   replaces the registry entry (`HashMap::insert`). The first stream's task continues running
   until it closes naturally — the master does not actively cancel it in this slice.
+- **The agent reconnects; it no longer exits on stream failure.** The slice-1 "log and exit"
+  requirement was REMOVED by `agent-fault-runtime`: an agent supervising live faults must
+  survive stream blips. Deployments that relied on exit-to-restart still work — the agent just
+  handles reconnection itself.
+- **`master_loss_threshold_secs` is agent config, deliberately NOT a master directive** (unlike
+  heartbeat cadence and `grace_secs`): it must keep working exactly when the master is
+  unreachable, so it cannot be delivered per-session.
+- **Deployment prerequisite: run the agent under a process supervisor** (`systemd
+  Restart=always`). Journal replay recovers instances after a restart, but an agent that dies
+  and is never restarted leaves an active fault ungoverned — a standalone OS-level watchdog is
+  deferred until the first stateful plugin (`tc`/`iptables`) lands (design D6 of
+  `agent-fault-runtime`).
+- **Instance ids are validated at the agent boundary** (charset `[A-Za-z0-9._:-]`, no `.`/`..`)
+  because they become journal file stems; an unusable id is logged and dropped, not aborted (no
+  addressable status can be emitted for it).
 - **CLI talks to the HTTP management plane, not gRPC.** `faultforge --master-url <url>` points at
   the master's management API (default `http://localhost:8069`), e.g. `agents list` → `GET /agents`.
   Agents are the only clients of the gRPC plane.
