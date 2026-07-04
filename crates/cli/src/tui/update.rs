@@ -32,7 +32,6 @@ pub fn update(mut model: Model, msg: Msg, now: SystemTime) -> (Model, Option<Eff
             model.loading = false;
             model.last_error = None;
             model.last_fetch = Some(now);
-            // Clamp selection to the new agent count.
             if model.agents.is_empty() {
                 model.selected = 0;
             } else {
@@ -55,20 +54,17 @@ fn handle_key(
 ) -> (Model, Option<Effect>) {
     use KeyCode::{Char, Down, Up};
 
-    // q or Ctrl-C → quit.
     if matches!(key.code, Char('q'))
         || matches!(key.code, Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
     {
         return (model, Some(Effect::Quit));
     }
 
-    // r → manual refresh.
     if matches!(key.code, Char('r')) {
         model.loading = true;
         return (model, Some(Effect::FetchAgents));
     }
 
-    // Arrow keys → move selection.
     let agent_count = model.agents.len();
     if matches!(key.code, Down) && agent_count > 0 {
         model.selected = (model.selected + 1).min(agent_count - 1);
@@ -204,7 +200,6 @@ mod tests {
         let mut model = Model::new();
         model.agents = vec![agent("a"), agent("b"), agent("c")];
         model.selected = 2;
-        // New load has only one agent — selection should clamp to 0.
         let (m, _) = update(model, Msg::AgentsLoaded(Ok(vec![agent("x")])), now());
         assert_eq!(m.selected, 0);
     }

@@ -1,23 +1,19 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use faultforge_proto::Hostname;
-use faultforge_proto::unix_ms;
 use faultforge_proto::v1::{
-    AgentMessage, HeartbeatAck, RegisterAck, ServerMessage, agent_message,
+    AgentMessage, ServerMessage,
     agent_service_server::{AgentService, AgentServiceServer},
-    server_message,
 };
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::MasterConfig;
-use crate::registry::{Registry, new_registry, register_agent, update_heartbeat};
+use crate::registry::{Registry, new_registry};
 
 // ===== Typed error for run_server =====
 
@@ -31,48 +27,6 @@ pub enum ServerError {
     Transport(#[from] tonic::transport::Error),
     #[error("management API server failed: {0}")]
     Management(std::io::Error),
-}
-
-// ===== Pure frame-processing functions =====
-
-/// Process a Register frame. Returns Ok((hostname, reply)) on success, Err(Status) otherwise.
-fn process_register(
-    hostname_str: &str,
-    already_registered: bool,
-    now: SystemTime,
-    heartbeat_interval_secs: u32,
-) -> Result<(Hostname, ServerMessage), Status> {
-    if already_registered {
-        return Err(Status::failed_precondition(
-            "duplicate register on active session",
-        ));
-    }
-    let hostname =
-        Hostname::parse(hostname_str).map_err(|e| Status::invalid_argument(e.to_string()))?;
-    let reply = ServerMessage {
-        payload: Some(server_message::Payload::RegisterAck(RegisterAck {
-            server_time_unix_ms: unix_ms(now),
-            heartbeat_interval_secs,
-        })),
-    };
-    Ok((hostname, reply))
-}
-
-/// Process a Heartbeat frame. Returns Ok(reply) on success, Err(Status) otherwise.
-fn process_heartbeat(
-    hostname: Option<&Hostname>,
-    now: SystemTime,
-) -> Result<ServerMessage, Status> {
-    match hostname {
-        None => Err(Status::failed_precondition(
-            "heartbeat received before register",
-        )),
-        Some(_) => Ok(ServerMessage {
-            payload: Some(server_message::Payload::HeartbeatAck(HeartbeatAck {
-                server_time_unix_ms: unix_ms(now),
-            })),
-        }),
-    }
 }
 
 // ===== MasterService =====
@@ -114,73 +68,14 @@ impl AgentService for MasterService {
         &self,
         request: Request<Streaming<AgentMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        let registry = Arc::clone(&self.registry);
-        let heartbeat_interval_secs = self.heartbeat_interval_secs;
-        let clock = Arc::clone(&self.clock);
-        let mut stream = request.into_inner();
         let (tx, rx) = mpsc::channel(32);
-
-        tokio::spawn(async move {
-            let mut hostname: Option<Hostname> = None;
-
-            loop {
-                match stream.message().await {
-                    Ok(Some(msg)) => match msg.payload {
-                        Some(agent_message::Payload::Register(reg)) => {
-                            let now = clock.now();
-                            match process_register(
-                                &reg.hostname,
-                                hostname.is_some(),
-                                now,
-                                heartbeat_interval_secs,
-                            ) {
-                                Ok((h, reply)) => {
-                                    register_agent(&registry, &h, now);
-                                    info!(hostname = %h, "agent registered");
-                                    hostname = Some(h);
-                                    if tx.send(Ok(reply)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(status) => {
-                                    error!("register error: {status}");
-                                    let _ = tx.send(Err(status)).await;
-                                    break;
-                                }
-                            }
-                        }
-                        Some(agent_message::Payload::Heartbeat(_)) => {
-                            let now = clock.now();
-                            match process_heartbeat(hostname.as_ref(), now) {
-                                Ok(reply) => {
-                                    if let Some(h) = &hostname {
-                                        update_heartbeat(&registry, h, now);
-                                        info!(hostname = %h, "heartbeat");
-                                    }
-                                    if tx.send(Ok(reply)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(status) => {
-                                    error!("heartbeat error: {status}");
-                                    let _ = tx.send(Err(status)).await;
-                                    break;
-                                }
-                            }
-                        }
-                        None => break,
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        error!("stream error: {e}");
-                        let _ = tx.send(Err(e)).await;
-                        break;
-                    }
-                }
-            }
-            info!("session closed for hostname: {hostname:?}");
-        });
-
+        tokio::spawn(crate::session::run(
+            request.into_inner(),
+            tx,
+            Arc::clone(&self.registry),
+            self.heartbeat_interval_secs,
+            Arc::clone(&self.clock),
+        ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -268,8 +163,6 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::registry::new_registry;
-    use faultforge_proto::Hostname;
-    use faultforge_proto::v1::server_message;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct FixedClock(SystemTime);
@@ -284,56 +177,5 @@ mod tests {
         let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let registry = new_registry();
         let _service = MasterService::with_clock(registry, 5, std::sync::Arc::new(FixedClock(t)));
-    }
-
-    #[test]
-    fn process_register_rejects_empty_hostname() {
-        let t = UNIX_EPOCH + Duration::from_secs(1000);
-        let result = process_register("", false, t, 5);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn process_register_rejects_duplicate() {
-        let t = UNIX_EPOCH + Duration::from_secs(1000);
-        let result = process_register("web-01", true, t, 5);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn process_register_success() {
-        let t = UNIX_EPOCH + Duration::from_secs(1000);
-        let result = process_register("web-01", false, t, 5);
-        assert!(result.is_ok());
-        let (hostname, msg) = result.unwrap();
-        assert_eq!(hostname.as_str(), "web-01");
-        match msg.payload {
-            Some(server_message::Payload::RegisterAck(ack)) => {
-                assert_eq!(ack.heartbeat_interval_secs, 5);
-                assert_eq!(ack.server_time_unix_ms, faultforge_proto::unix_ms(t));
-            }
-            _ => panic!("expected RegisterAck"),
-        }
-    }
-
-    #[test]
-    fn process_heartbeat_before_register_fails() {
-        let t = UNIX_EPOCH + Duration::from_secs(1000);
-        let result = process_heartbeat(None, t);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn process_heartbeat_success() {
-        let t = UNIX_EPOCH + Duration::from_secs(1000);
-        let hostname = Hostname::parse("web-01").unwrap();
-        let result = process_heartbeat(Some(&hostname), t);
-        assert!(result.is_ok());
-        match result.unwrap().payload {
-            Some(server_message::Payload::HeartbeatAck(ack)) => {
-                assert_eq!(ack.server_time_unix_ms, faultforge_proto::unix_ms(t));
-            }
-            _ => panic!("expected HeartbeatAck"),
-        }
     }
 }

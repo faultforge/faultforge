@@ -52,7 +52,7 @@ fn spawn_key_reader(tx: mpsc::UnboundedSender<Msg>) -> KeyReaderHandle {
                         break;
                     }
                 }
-                Ok(_) => {} // ignore non-key and non-press events
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
@@ -116,10 +116,9 @@ async fn event_loop(
     // fetch completions from spawned async tasks.
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
-    // Start the blocking key-reader thread.
     let _key_reader = spawn_key_reader(tx.clone());
 
-    // Trigger an initial fetch before waiting for the first tick.
+    // Fetch once up front so the UI isn't empty before the first poll tick.
     spawn_fetch(client.clone(), tx.clone());
     model.loading = true;
 
@@ -129,9 +128,7 @@ async fn event_loop(
         terminal.draw(|frame| view::view(&model, now, frame))?;
 
         let msg = tokio::select! {
-            // A message from either the key-reader thread or a fetch result.
             Some(msg) = rx.recv() => msg,
-            // Polling tick.
             _ = ticker.tick() => Msg::Tick,
         };
 

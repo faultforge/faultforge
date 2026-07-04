@@ -1,0 +1,21 @@
+[package]
+name = "noop-marker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "noop-marker"
+path = "src/main.rs"
+
+[dependencies]
+faultforge-fault = { path = "../../fault" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+humantime = { workspace = true }
+# Used in the binary: NamedTempFile for the preflight probe and the atomic
+# marker write. Also serves the golden tests (tempdir).
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

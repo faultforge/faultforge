@@ -5,6 +5,7 @@ pub mod config;
 pub mod management;
 pub mod registry;
 mod server;
+mod session;
 
 pub use config::{Cli, MasterConfig, load_config};
 pub use management::{AgentView, ManagementState, agent_view, router};

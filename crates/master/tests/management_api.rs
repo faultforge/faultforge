@@ -21,7 +21,6 @@ use tonic::transport::Channel;
 async fn start_servers() -> (String, String, Registry) {
     let registry = new_registry();
 
-    // gRPC agent plane.
     let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let grpc_addr = grpc_listener.local_addr().unwrap();
     let service = MasterService::new(Arc::clone(&registry), 1);
@@ -33,7 +32,6 @@ async fn start_servers() -> (String, String, Registry) {
             .unwrap();
     });
 
-    // Management API.
     let management_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let management_addr = management_listener.local_addr().unwrap();
     let app = router(ManagementState {
@@ -90,7 +88,6 @@ async fn management_api_exposes_registered_agent() {
 
     let client = reqwest::Client::new();
 
-    // GET /agents — list contains the registered agent.
     let list: Vec<serde_json::Value> = client
         .get(format!("{management_url}/agents"))
         .send()
@@ -107,7 +104,6 @@ async fn management_api_exposes_registered_agent() {
         "last_seen_unix_ms must be a numeric timestamp"
     );
 
-    // GET /agents/web-01 — single agent.
     let resp = client
         .get(format!("{management_url}/agents/web-01"))
         .send()
@@ -118,7 +114,6 @@ async fn management_api_exposes_registered_agent() {
     assert_eq!(agent["hostname"], "web-01");
     assert_eq!(agent["name"], "web-01");
 
-    // GET /agents/unknown-host — 404.
     let resp = client
         .get(format!("{management_url}/agents/unknown-host"))
         .send()

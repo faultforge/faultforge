@@ -39,7 +39,6 @@ pub fn load_config(cli: &Cli) -> Result<MasterConfig, ::config::ConfigError> {
             .required(cli.config.is_some()),
     );
 
-    // Env vars: FAULTFORGE_LISTEN_ADDR, FAULTFORGE_HEARTBEAT_INTERVAL_SECS
     // No .separator() so field names with underscores are matched literally.
     builder = builder.add_source(Environment::with_prefix("FAULTFORGE").try_parsing(true));
 
