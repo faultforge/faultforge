@@ -44,6 +44,11 @@ pub enum Command {
         #[command(subcommand)]
         sub: AgentsCommand,
     },
+    /// Run, inspect, and halt fault experiments.
+    Experiment {
+        #[command(subcommand)]
+        sub: ExperimentCommand,
+    },
 }
 
 /// Subcommands for the `agents` noun.
@@ -55,5 +60,37 @@ pub enum AgentsCommand {
     Show {
         /// The agent hostname to look up.
         hostname: String,
+    },
+    /// Clear a host's taint quarantine (relayed to the agent by the master).
+    ClearTaint {
+        /// The tainted agent's hostname.
+        hostname: String,
+    },
+}
+
+/// Subcommands for the `experiment` noun.
+#[derive(Debug, Subcommand)]
+pub enum ExperimentCommand {
+    /// Submit an experiment definition (YAML or JSON file) and dispatch it.
+    Run {
+        /// Path to the experiment definition file.
+        #[arg(short, long)]
+        file: std::path::PathBuf,
+        /// Poll until the experiment is terminal; the exit code reflects the
+        /// outcome (0 COMPLETED, distinct non-zero for ABORTED / ERROR).
+        #[arg(long)]
+        wait: bool,
+    },
+    /// List experiments known to the master (this master lifetime only).
+    List,
+    /// Show one experiment with per-instance states and the outcome cause.
+    Show {
+        /// The experiment id.
+        id: String,
+    },
+    /// Halt a running experiment (fires the global kill-switch).
+    Halt {
+        /// The experiment id.
+        id: String,
     },
 }

@@ -26,8 +26,19 @@ pub enum ApiError {
     Transport(String),
 
     /// The requested resource was not found (HTTP 404).
-    #[error("agent not found")]
+    #[error("not found")]
     NotFound,
+
+    /// The request conflicts with the resource's current state (HTTP 409),
+    /// e.g. halting a concluded experiment or clearing taint on a
+    /// disconnected host.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    /// The master rejected the experiment at VALIDATE (HTTP 422); every
+    /// failing check is listed.
+    #[error("experiment rejected: {}", .0.join("; "))]
+    Validation(Vec<String>),
 
     /// The master returned an unexpected non-2xx status (e.g. 500). `body` is
     /// retained for diagnostics but omitted from the short `Display` message.

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 faultforge-proto = { path = "../proto" }
+faultforge-fault = { path = "../fault", features = ["proto"] }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -20,6 +21,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

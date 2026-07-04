@@ -11,20 +11,21 @@ Cargo workspace, 6 crates:
 |-------|-----|--------|------|
 | `crates/proto` | — | **built** | Shared gRPC contract; `build.rs` compiles `proto/faultforge.proto`. Carries the fault wire schema (`RunFault`/`AbortFault`, `FaultEvent`/`InstanceStatus`/`InstanceReport`/`TaintStatus`, `InstanceState`) |
 | `crates/fault` | — | **built** | Shared fault contract (`faultforge-fault`): manifest parsing/validation, params schema, agent↔plugin invocation protocol (stdin JSON, NDJSON events, exit-code table), lifecycle states, sha256 digest, catalog layout. Sync, no tonic/tokio; the optional `proto` feature adds domain⇄wire `InstanceState` conversions (agent/master only — plugin binaries never enable it) |
-| `crates/master` | `faultforge-master` | **built (slice 1)** | Two planes over one registry: gRPC agent server + read-only HTTP management API; in-memory hostname registry, layered config |
+| `crates/master` | `faultforge-master` | **built (slice 3)** | Two planes over one registry: gRPC agent server + HTTP management API (reads **and** the fault-dispatch writes); in-memory hostname registry + experiment store, on-disk plugin catalog, layered config |
 | `crates/agent` | `faultforge-agent` | **built (slice 2)** | Dials master with reconnect+backoff, register/heartbeat, and the **fault runtime**: executes fault instances from the on-disk catalog with a journal, safety timers, and taint quarantine |
-| `crates/cli` | `faultforge` | **built** | Operator CLI — one-shot scripting (`agents list/show`) + interactive TUI |
+| `crates/cli` | `faultforge` | **built** | Operator CLI — one-shot scripting (`agents list/show/clear-taint`, `experiment run/list/show/halt`) + interactive TUI |
 | `crates/plugins/noop-marker` | `noop-marker` | **built** | Reference fault plugin: zero-blast-radius fault whose only effect is a marker file's existence. Proves the `faultforge-fault` contract with golden tests |
 
-**The agent executes faults; the master does not dispatch yet.** The `agent-fault-runtime` change
-gave the agent the full instance lifecycle: `RunFault`/`AbortFault` handling, a pure per-instance
-state machine (`crates/agent/src/machine.rs`), digest verification before *every* plugin
-invocation, two-phase preflight, an instance journal with restart replay, the one-timer safety
-triad (duration stop / master-loss self-abort / dead-man), and persistent `TAINTED` quarantine.
-The master still only logs the agent's fault frames — dispatch, experiment records, and
-management-plane writes arrive in `master-fault-dispatch`. Until then the only way to drive the
-runtime is a gRPC client speaking the `Session` stream (see the fake master in
-`crates/agent/tests/runtime.rs`).
+**Fault injection works end to end (`master-fault-dispatch`, slice 3).** The agent owns the full
+instance lifecycle (`agent-fault-runtime`): `RunFault`/`AbortFault`/`ClearTaint` handling, a pure
+per-instance state machine (`crates/agent/src/machine.rs`), digest verification before *every*
+plugin invocation, two-phase preflight, an instance journal with restart replay, the one-timer
+safety triad (duration stop / master-loss self-abort / dead-man), and persistent `TAINTED`
+quarantine. The master dispatches **experiment-lite** records: explicit-hostname targeting,
+single salvo, no metric rules/connectors, reduced outcome lattice `COMPLETED`/`ABORTED`/`ERROR`
+(`ERROR` dominates). Operators drive it via the management API or the CLI
+(`experiment run -f file.yaml [--wait]`). The full `experiment-model` (tags, guardrails,
+hypotheses, `RESILIENT`/`WEAKNESS_FOUND`) is still future work.
 
 ## Commands
 
@@ -52,6 +53,9 @@ cargo run -p faultforge-agent -- --master-addr http://127.0.0.1:50051
 # CLI — talks to the HTTP management API (default http://localhost:8069)
 cargo run -p faultforge -- agents list
 cargo run -p faultforge -- agents show <hostname>
+cargo run -p faultforge -- experiment run -f exp.yaml --wait
+cargo run -p faultforge -- experiment halt <id>
+cargo run -p faultforge -- agents clear-taint <hostname>
 ```
 
 ## Coding standards
@@ -91,22 +95,41 @@ the reconciliation sequence: `InstanceReport` (live instances; empty is meaningf
 - `journal.rs` / `taint.rs` — atomic (temp+rename) versioned records under `data_dir`; the taint
   file fails closed (unreadable = tainted) and is never removed by the agent.
 
-**Current state: single in-memory registry, no persistence.**
+**Current state: in-memory registry + in-memory experiment store, no persistence.**
 The master keeps `Registry = Arc<Mutex<HashMap<Hostname, AgentInfo>>>` where `AgentInfo
-{ hostname, name, last_seen }` (`crates/master/src/registry.rs`). There is no SQLite store or
-staleness sweep in this slice. On master restart the registry is empty; agents reconnect and
-re-register on their own.
+{ hostname, name, last_seen, tainted }` (`crates/master/src/registry.rs`) and an experiment
+store inside `Dispatcher` (`crates/master/src/dispatch.rs`). There is no SQLite store or
+staleness sweep. On master restart both are empty (ADR-0002 §17): agents reconnect and
+re-register; running experiments are forgotten — the agents' own safety net (self-abort,
+journal replay) keeps hosts safe, and frames for unknown instances are logged and dropped.
+
+**Master fault dispatch (slice 3).** Functional core / imperative shell again:
+- `experiment.rs` — pure experiment-lite domain: definition/record types, deterministic
+  `instance_id = <experiment_id>:<hostname>:<action_index>` (ADR-0002 §12), all-failures
+  validation, kill-switch trigger, outcome lattice.
+- `dispatch.rs` — the orchestration shell (`Dispatcher`): accept → validate → mint → single-salvo
+  `RunFault` fan-out; intake of agent-authoritative `InstanceStatus`/`InstanceReport`/`TaintStatus`
+  frames (`FaultEvent` is log-only); kill-switch (`AbortFault` to all non-terminal instances) on
+  the first ERROR / unrequested abort / in-scope taint / halt; a per-experiment deadline
+  (`start + max(duration+grace) + 30s`) so no record stays non-terminal.
+- `catalog.rs` — loads the plugin catalog from `catalog_root` at startup with the shared
+  `faultforge-fault` loader (same on-disk layout as the agent's `plugin_root`; broken entries are
+  logged and skipped).
+- `sessions.rs` — per-hostname outbound session map (insert-supersede on register, remove
+  only-if-current on stream close) so dispatch can push frames to a chosen agent.
 
 **Two planes over one registry.** The master runs two independent listeners sharing the same
 `Registry` handle:
 - **gRPC agent plane** (`listen_addr`, default `:50051`) — the `Session` stream described above;
   the only plane agents ever touch.
 - **HTTP management plane** (`management_listen_addr`, default `:8069`,
-  `crates/master/src/management.rs`) — a **read-only** axum API for operators and the CLI:
-  `GET /agents` (JSON array of `AgentView { hostname, name, last_seen_unix_ms }`) and
-  `GET /agents/{hostname}` (`404` if absent). It never talks to agents and performs no
-  fault injection — it only reads registry state. No auth/TLS during WIP. The pure core is
-  `agent_view`; handlers are the imperative shell.
+  `crates/master/src/management.rs`) — an axum API for operators and the CLI. Reads:
+  `GET /agents` (`AgentView { hostname, name, last_seen_unix_ms, tainted }`),
+  `GET /agents/{hostname}`, `GET /experiments`, `GET /experiments/{id}`. Writes (the
+  fault-dispatch surface, `master-fault-dispatch`): `POST /experiments` (validate → `422` with
+  *all* failing checks, or `201` + dispatch), `POST /experiments/{id}/halt` (`202`/`404`/`409`),
+  `POST /agents/{hostname}/clear-taint` (`202`/`404`/`409`). **No auth/TLS during WIP — never
+  expose the management port beyond a trusted network (ADR-0002 known gap).**
 
 **Identity is hostname only (slice 1).**
 The agent sends only `Register { hostname }` — no UUID, no local state file. The master keys
@@ -131,7 +154,9 @@ Both binaries use layered sources (lowest → highest priority):
 4. CLI flags
 
 Master defaults: `listen_addr = 127.0.0.1:50051`, `management_listen_addr = 127.0.0.1:8069`,
-`heartbeat_interval_secs = 5`.
+`heartbeat_interval_secs = 5`, `catalog_root = /usr/lib/faultforge/plugins`,
+`default_grace_secs = 10` (grace is a master decision carried in `RunFault`, like heartbeat
+cadence).
 Agent: `master_addr` is **required** — startup fails if absent from all sources. Runtime keys
 (all defaulted): `plugin_root = /usr/lib/faultforge/plugins`, `data_dir = /var/lib/faultforge`,
 `master_loss_threshold_secs = 30`, `invocation_timeout_secs = 60` (env/file only, no CLI flag).
@@ -166,6 +191,15 @@ Running as non-root in dev requires pointing `data_dir` at a writable path.
 - **CLI talks to the HTTP management plane, not gRPC.** `faultforge --master-url <url>` points at
   the master's management API (default `http://localhost:8069`), e.g. `agents list` → `GET /agents`.
   Agents are the only clients of the gRPC plane.
+- **CLI exit codes are part of the contract:** `0` OK/`COMPLETED`, `1` transport/unexpected, `2`
+  not found, `3` rejected at VALIDATE, `4` waited experiment `ABORTED`, `5` waited experiment
+  `ERROR` — `experiment run --wait` is usable as a scripted chaos gate.
+- **Taint is cleared only via `ClearTaint`** (operator → management API → master relays over the
+  host's live `Session`; the agent removes `tainted.json` and answers with `TaintStatus`). The
+  agent never clears it on its own; the master never assumes it — the registry flag updates only
+  from the agent's report. Clearing a disconnected host returns `409`.
+- **The experiment deadline margin is a constant** (`DEADLINE_MARGIN_MS = 30s`) with a
+  `Dispatcher::with_deadline_margin_ms` override used by tests to compress timing.
 - **CLI config is a single flag, not layered.** `faultforge --master-url <url>` is the only
   configuration mechanism for the CLI — there is no config file, no `FAULTFORGE_` env var
   layering, and no `--config` flag. This is intentional: the CLI has exactly one value to

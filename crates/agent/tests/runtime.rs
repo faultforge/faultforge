@@ -21,8 +21,8 @@ use faultforge_fault::proto::to_wire_i32;
 use faultforge_fault::state::InstanceState;
 use faultforge_proto::v1::agent_service_server::{AgentService, AgentServiceServer};
 use faultforge_proto::v1::{
-    AbortFault, AgentMessage, HeartbeatAck, InstanceReport, InstanceStatus, RegisterAck, RunFault,
-    ServerMessage, agent_message, server_message,
+    AbortFault, AgentMessage, ClearTaint, HeartbeatAck, InstanceReport, InstanceStatus,
+    RegisterAck, RunFault, ServerMessage, agent_message, server_message,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -281,6 +281,26 @@ fn abort_fault(id: &str) -> ServerMessage {
     }
 }
 
+fn clear_taint() -> ServerMessage {
+    ServerMessage {
+        payload: Some(server_message::Payload::ClearTaint(ClearTaint {})),
+    }
+}
+
+/// The next `TaintStatus` frame, skipping everything else.
+async fn next_taint_status(session: &mut FakeSession) -> faultforge_proto::v1::TaintStatus {
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, session.from_agent.recv())
+            .await
+            .expect("timed out waiting for TaintStatus")
+            .expect("session closed");
+        if let Some(agent_message::Payload::TaintStatus(ts)) = msg.payload {
+            return ts;
+        }
+    }
+}
+
 /// Receive frames until `id` reaches `state`, returning everything seen
 /// (heartbeats included) so callers can assert on the full stream. The
 /// deadline is overall, not per-frame — a 1s heartbeat cadence must not keep a
@@ -508,6 +528,51 @@ async fn cleanup_exit_30_twice_taints_the_host_and_blocks_new_faults() {
     assert!(last2.reason.contains("tainted"), "{}", last2.reason);
     let marker_lines = std::fs::read_to_string(&marker).unwrap();
     assert_eq!(marker_lines.lines().count(), 1, "i-2 never ran inject");
+}
+
+#[tokio::test]
+async fn clear_taint_lifts_the_quarantine_and_new_faults_run() {
+    let mut bed = TestBed::start(1).await;
+    let marker = bed.data_dir.path().join("marker");
+    let bad_body = "cat > /dev/null\n[ \"$1\" = cleanup ] && exit 30\nexit 0";
+    let bad_digest = install_plugin(bed.plugin_root.path(), "bad", bad_body);
+    let good_digest = install_plugin(bed.plugin_root.path(), "good", &marker_plugin_body(&marker));
+    bed.spawn_agent(30, 10);
+    let mut session = bed.master.session().await;
+
+    session
+        .send(run_fault("i-1", "bad", &bad_digest, 1, 60))
+        .await;
+    frames_until_state(&mut session, "i-1", InstanceState::Error).await;
+    assert!(bed.taint_path().exists());
+
+    session.send(clear_taint()).await;
+    let ts = next_taint_status(&mut session).await;
+    assert!(!ts.tainted, "clear must report tainted: false");
+    assert!(!bed.taint_path().exists(), "taint record must be removed");
+
+    // The quarantine is lifted: a new fault runs a full lifecycle again.
+    session
+        .send(run_fault("i-2", "good", &good_digest, 1, 10))
+        .await;
+    frames_until_state(&mut session, "i-2", InstanceState::Done).await;
+}
+
+#[tokio::test]
+async fn clear_taint_on_a_clean_host_is_harmless() {
+    let mut bed = TestBed::start(1).await;
+    bed.spawn_agent(30, 10);
+    let mut session = bed.master.session().await;
+
+    // Consume the reconciliation TaintStatus so the next one observed is the
+    // ClearTaint answer, not the post-register report.
+    let initial = next_taint_status(&mut session).await;
+    assert!(!initial.tainted);
+
+    session.send(clear_taint()).await;
+    let ts = next_taint_status(&mut session).await;
+    assert!(!ts.tainted);
+    assert!(!bed.taint_path().exists());
 }
 
 #[tokio::test]

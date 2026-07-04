@@ -14,11 +14,12 @@ dials the master and keeps one long-lived gRPC stream open (so it works through
 NAT and firewalls). You drive the whole fleet from the `faultforge` CLI.
 
 > [!NOTE]
-> FaultForge is still early. Agents register, heartbeat, and can execute fault
-> plugins with a safe, recoverable lifecycle (journal, safety timers, host
-> quarantine) — but the master cannot dispatch faults yet, so there is no
-> end-to-end fault injection from the CLI. That arrives with the master's
-> dispatch slice.
+> FaultForge is still early, but the core loop is closed: you can run a fault
+> experiment from the CLI end to end — the master validates it against its
+> plugin catalog, dispatches to agents, tracks every instance, halts on demand
+> or on failure, and reports `COMPLETED` / `ABORTED` / `ERROR`. What's missing
+> for production use: metric-based guardrails/verdicts, tag targeting, and —
+> critically — authentication/TLS (keep both planes on a trusted network).
 
 ## Architecture
 
@@ -36,9 +37,11 @@ NAT and firewalls). You drive the whole fleet from the `faultforge` CLI.
 | Crate | Binary | Role |
 |-------|--------|------|
 | `crates/proto`  | —                   | Shared gRPC contract (`faultforge.proto`) |
-| `crates/master` | `faultforge-master` | gRPC server, host registry, HTTP management API |
-| `crates/agent`  | `faultforge-agent`  | Runs on a target host; registers and heartbeats |
+| `crates/fault`  | —                   | Shared fault contract: manifests, params, digests, plugin protocol |
+| `crates/master` | `faultforge-master` | Control plane: registry, plugin catalog, experiment dispatch, HTTP management API |
+| `crates/agent`  | `faultforge-agent`  | Runs on a target host; executes fault instances with a safe, recoverable lifecycle |
 | `crates/cli`    | `faultforge`        | Operator CLI — one-shot scripting and an interactive TUI |
+| `crates/plugins/noop-marker` | `noop-marker` | Reference fault plugin (zero blast radius) |
 
 ## Quick start
 
@@ -62,6 +65,11 @@ cargo run -p faultforge-master
 cargo run -p faultforge-agent -- --master-addr http://master-host:50051
 ```
 
+Both hosts need the plugin catalog on disk (the same directory layout for the
+master's `--catalog-root` and the agent's `--plugin-root`, default
+`/usr/lib/faultforge/plugins`): one `<name>@<version>/` directory per plugin
+holding `manifest.yaml` and the executable.
+
 **3. Look at the fleet** with the CLI:
 
 ```bash
@@ -73,6 +81,33 @@ faultforge --master-url http://master-host:8069 -o table agents list      # huma
 # Or launch the interactive TUI (no subcommand, on a TTY)
 faultforge
 ```
+
+**4. Run an experiment.** Write a definition:
+
+```yaml
+# exp.yaml
+name: first-fault
+actions:
+  - hosts: [web-01]
+    plugin: { name: noop-marker, version: "1" }
+    params: { marker_path: /tmp/faultforge-marker }
+    duration_secs: 30
+```
+
+and drive it:
+
+```bash
+faultforge experiment run -f exp.yaml --wait   # exit 0 COMPLETED, 4 ABORTED, 5 ERROR
+faultforge experiment list
+faultforge experiment show <id>
+faultforge experiment halt <id>                # fire the kill-switch
+faultforge agents clear-taint <hostname>       # lift a host quarantine
+```
+
+The master validates everything up front (catalog, params, durations, targets),
+fans the faults out as one salvo, and stops **all** instances if any one of
+them fails — a host that cannot be cleaned up is quarantined (`TAINTED`) until
+an operator clears it.
 
 ## Development
 

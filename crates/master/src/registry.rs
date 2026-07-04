@@ -9,6 +9,9 @@ pub struct AgentInfo {
     pub hostname: Hostname,
     pub name: String,
     pub last_seen: SystemTime,
+    /// Host quarantine per the agent's last `TaintStatus` (`false` until any
+    /// report). Updated only from agent frames — the master never assumes it.
+    pub tainted: bool,
 }
 
 pub type Registry = Arc<Mutex<HashMap<Hostname, AgentInfo>>>;
@@ -24,17 +27,38 @@ pub fn new_registry() -> Registry {
 ///
 /// Panics if the registry mutex is poisoned.
 pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime) {
+    #[allow(clippy::expect_used)]
+    // mutex poison means a previous thread panicked; propagating is correct
+    let mut reg = registry.lock().expect("registry lock poisoned");
+    // Re-registration must not read as "clean" before the agent's own
+    // TaintStatus arrives moments later — carry the last known quarantine over.
+    let tainted = reg.get(hostname).is_some_and(|info| info.tainted);
     let info = AgentInfo {
         name: hostname.to_string(),
         hostname: hostname.clone(),
         last_seen: now,
+        tainted,
     };
+    reg.insert(hostname.clone(), info);
+}
+
+/// Record the host quarantine state reported by the agent's `TaintStatus`.
+///
+/// Does nothing if the hostname is not found in the registry.
+///
+/// # Panics
+///
+/// Panics if the registry mutex is poisoned.
+pub fn set_taint(registry: &Registry, hostname: &Hostname, tainted: bool) {
     #[allow(clippy::expect_used)]
     // mutex poison means a previous thread panicked; propagating is correct
-    registry
+    if let Some(entry) = registry
         .lock()
         .expect("registry lock poisoned")
-        .insert(hostname.clone(), info);
+        .get_mut(hostname)
+    {
+        entry.tainted = tainted;
+    }
 }
 
 /// Update the `last_seen` timestamp for a registered agent.
@@ -97,5 +121,25 @@ mod tests {
         register_agent(&registry, &hostname("web-01"), t1);
         update_heartbeat(&registry, &hostname("web-01"), t2);
         assert_eq!(registry.lock().unwrap()[&hostname("web-01")].last_seen, t2);
+    }
+
+    #[test]
+    fn taint_is_recorded_and_survives_re_registration() {
+        let registry = new_registry();
+        let t = UNIX_EPOCH + Duration::from_secs(1000);
+        register_agent(&registry, &hostname("web-01"), t);
+        assert!(!registry.lock().unwrap()[&hostname("web-01")].tainted);
+
+        set_taint(&registry, &hostname("web-01"), true);
+        assert!(registry.lock().unwrap()[&hostname("web-01")].tainted);
+
+        register_agent(&registry, &hostname("web-01"), t);
+        assert!(
+            registry.lock().unwrap()[&hostname("web-01")].tainted,
+            "re-registration must not clear the quarantine flag"
+        );
+
+        set_taint(&registry, &hostname("web-01"), false);
+        assert!(!registry.lock().unwrap()[&hostname("web-01")].tainted);
     }
 }

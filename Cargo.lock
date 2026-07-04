@@ -729,12 +729,15 @@ name = "faultforge-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "crossterm",
  "ratatui",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_norway",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -760,10 +763,12 @@ dependencies = [
  "axum",
  "clap",
  "config",
+ "faultforge-fault",
  "faultforge-proto",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

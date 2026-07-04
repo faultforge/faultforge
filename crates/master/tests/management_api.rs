@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use faultforge_master::{ManagementState, MasterService, Registry, new_registry, router};
+use faultforge_master::clock::SystemClock;
+use faultforge_master::{
+    Catalog, Dispatcher, ManagementState, MasterService, Registry, new_registry, router,
+};
 use faultforge_proto::v1::{
     AgentMessage, Register, agent_message, agent_service_client::AgentServiceClient,
     agent_service_server::AgentServiceServer, server_message,
@@ -20,10 +23,16 @@ use tonic::transport::Channel;
 /// Returns `(grpc_url, management_base_url, registry)`.
 async fn start_servers() -> (String, String, Registry) {
     let registry = new_registry();
+    let dispatcher = Arc::new(Dispatcher::new(
+        Catalog::default(),
+        Arc::clone(&registry),
+        10,
+        Arc::new(SystemClock),
+    ));
 
     let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let grpc_addr = grpc_listener.local_addr().unwrap();
-    let service = MasterService::new(Arc::clone(&registry), 1);
+    let service = MasterService::new(Arc::clone(&dispatcher), 1);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(AgentServiceServer::new(service))
@@ -36,6 +45,7 @@ async fn start_servers() -> (String, String, Registry) {
     let management_addr = management_listener.local_addr().unwrap();
     let app = router(ManagementState {
         registry: Arc::clone(&registry),
+        dispatcher,
     });
     tokio::spawn(async move {
         axum::serve(management_listener, app).await.unwrap();

@@ -81,6 +81,7 @@ fn server_frame_label(payload: Option<&server_message::Payload>) -> &'static str
         Some(server_message::Payload::HeartbeatAck(_)) => "HeartbeatAck",
         Some(server_message::Payload::RunFault(_)) => "RunFault",
         Some(server_message::Payload::AbortFault(_)) => "AbortFault",
+        Some(server_message::Payload::ClearTaint(_)) => "ClearTaint",
         None => "unknown/future (empty payload)",
     }
 }
@@ -361,6 +362,10 @@ fn dispatch(msg: ServerMessage, supervisor: &mut Supervisor) {
         Some(server_message::Payload::AbortFault(abort)) => {
             info!(instance_id = %abort.instance_id, "AbortFault received");
             supervisor.handle_abort_fault(&abort.instance_id);
+        }
+        Some(server_message::Payload::ClearTaint(_)) => {
+            info!("ClearTaint received");
+            supervisor.handle_clear_taint();
         }
         Some(server_message::Payload::HeartbeatAck(ack)) => {
             debug!(server_time = ack.server_time_unix_ms, "heartbeat ack");

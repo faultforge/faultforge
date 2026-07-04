@@ -11,9 +11,10 @@ use faultforge_proto::v1::{
     agent_service_server::{AgentService, AgentServiceServer},
 };
 
-use crate::clock::{Clock, SystemClock};
+use crate::clock::SystemClock;
 use crate::config::MasterConfig;
-use crate::registry::{Registry, new_registry};
+use crate::dispatch::Dispatcher;
+use crate::registry::new_registry;
 
 // ===== Typed error for run_server =====
 
@@ -32,30 +33,15 @@ pub enum ServerError {
 // ===== MasterService =====
 
 pub struct MasterService {
-    registry: Registry,
+    dispatcher: Arc<Dispatcher>,
     heartbeat_interval_secs: u32,
-    clock: Arc<dyn Clock>,
 }
 
 impl MasterService {
-    pub fn new(registry: Registry, heartbeat_interval_secs: u32) -> Self {
+    pub fn new(dispatcher: Arc<Dispatcher>, heartbeat_interval_secs: u32) -> Self {
         Self {
-            registry,
+            dispatcher,
             heartbeat_interval_secs,
-            clock: Arc::new(SystemClock),
-        }
-    }
-
-    /// Constructor for tests or custom deployments that need a specific clock.
-    pub fn with_clock(
-        registry: Registry,
-        heartbeat_interval_secs: u32,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
-            registry,
-            heartbeat_interval_secs,
-            clock,
         }
     }
 }
@@ -72,9 +58,8 @@ impl AgentService for MasterService {
         tokio::spawn(crate::session::run(
             request.into_inner(),
             tx,
-            Arc::clone(&self.registry),
+            Arc::clone(&self.dispatcher),
             self.heartbeat_interval_secs,
-            Arc::clone(&self.clock),
         ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -122,9 +107,22 @@ pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
     let grpc_addr = resolve_addr(&cfg.listen_addr).await?;
     let management_addr = resolve_addr(&cfg.management_listen_addr).await?;
 
-    // Single registry instance shared by both servers (one source of truth).
+    let catalog = crate::catalog::load_catalog(std::path::Path::new(&cfg.catalog_root));
+    info!(
+        catalog_root = %cfg.catalog_root,
+        plugins = catalog.len(),
+        "plugin catalog loaded"
+    );
+
+    // Single registry + dispatcher shared by both planes (one source of truth).
     let registry = new_registry();
-    let service = MasterService::new(Arc::clone(&registry), cfg.heartbeat_interval_secs);
+    let dispatcher = Arc::new(Dispatcher::new(
+        catalog,
+        Arc::clone(&registry),
+        cfg.default_grace_secs,
+        Arc::new(SystemClock),
+    ));
+    let service = MasterService::new(Arc::clone(&dispatcher), cfg.heartbeat_interval_secs);
 
     info!(%grpc_addr, "faultforge-master gRPC agent plane listening");
     info!(%management_addr, "faultforge-master management API listening");
@@ -143,7 +141,10 @@ pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
             .map_err(ServerError::Management)?;
         axum::serve(
             listener,
-            crate::management::router(crate::management::ManagementState { registry }),
+            crate::management::router(crate::management::ManagementState {
+                registry,
+                dispatcher,
+            }),
         )
         .await
         .map_err(ServerError::Management)
@@ -161,21 +162,17 @@ pub async fn run_server(cfg: MasterConfig) -> Result<(), ServerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::Clock;
+    use crate::catalog::Catalog;
     use crate::registry::new_registry;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    struct FixedClock(SystemTime);
-    impl Clock for FixedClock {
-        fn now(&self) -> SystemTime {
-            self.0
-        }
-    }
 
     #[test]
-    fn with_clock_accepts_custom_clock() {
-        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let registry = new_registry();
-        let _service = MasterService::with_clock(registry, 5, std::sync::Arc::new(FixedClock(t)));
+    fn master_service_builds_over_a_dispatcher() {
+        let dispatcher = Arc::new(Dispatcher::new(
+            Catalog::default(),
+            new_registry(),
+            10,
+            Arc::new(SystemClock),
+        ));
+        let _service = MasterService::new(dispatcher, 5);
     }
 }

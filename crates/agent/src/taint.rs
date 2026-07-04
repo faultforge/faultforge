@@ -1,8 +1,7 @@
 //! Host quarantine (ADR-0002 §9, design D9): a `tainted.json` record under
 //! `data_dir` whose presence means the host failed recovery and must not run
-//! new faults. The agent writes it and reports it; only an operator clears it
-//! (the clear command arrives in `master-fault-dispatch`; until then the file
-//! is removed by hand).
+//! new faults. The agent writes it and reports it; it is cleared only on an
+//! operator-issued `ClearTaint` relayed by the master.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -82,6 +81,22 @@ impl Taint {
         }
         Ok(())
     }
+
+    /// Remove the taint record. Idempotent: an absent record is already clear.
+    ///
+    /// Only ever called for an operator-issued `ClearTaint` — the agent never
+    /// clears the quarantine on its own initiative (agent-fault-runtime spec).
+    ///
+    /// # Errors
+    ///
+    /// Returns the IO error if the record exists but cannot be removed; the
+    /// host stays tainted in that case.
+    pub fn clear(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
 }
 
 // ===== Unit tests =====
@@ -129,6 +144,36 @@ mod tests {
         std::fs::write(dir.path().join("tainted.json"), "garbage").unwrap();
         let current = Taint::new(dir.path()).current().unwrap();
         assert!(current.reason.contains("corrupt"));
+    }
+
+    #[test]
+    fn clear_removes_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let taint = Taint::new(dir.path());
+        taint.mark(&record("r")).unwrap();
+        taint.clear().unwrap();
+        assert!(taint.current().is_none());
+    }
+
+    #[test]
+    fn clear_on_a_clean_host_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Taint::new(dir.path()).clear().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_clear_keeps_the_quarantine() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let taint = Taint::new(dir.path());
+        taint.mark(&record("r")).unwrap();
+        // A read-only parent directory makes the unlink fail.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = taint.clear();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert!(taint.current().is_some());
     }
 
     #[test]
