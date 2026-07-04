@@ -14,8 +14,11 @@ dials the master and keeps one long-lived gRPC stream open (so it works through
 NAT and firewalls). You drive the whole fleet from the `faultforge` CLI.
 
 > [!NOTE]
-> FaultForge is still early. Right now agents can register and send heartbeats;
-> fault injection is coming next.
+> FaultForge is still early. Agents register, heartbeat, and can execute fault
+> plugins with a safe, recoverable lifecycle (journal, safety timers, host
+> quarantine) — but the master cannot dispatch faults yet, so there is no
+> end-to-end fault injection from the CLI. That arrives with the master's
+> dispatch slice.
 
 ## Architecture
 

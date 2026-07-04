@@ -223,6 +223,7 @@ async fn fault_frame_does_not_kill_session() {
             state: InstanceState::Active as i32,
             ts_unix_ms: 1,
             reason: String::new(),
+            plugin_digest: String::new(),
         })),
     })
     .await

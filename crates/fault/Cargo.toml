@@ -11,6 +11,12 @@ serde_norway = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+# Optional: domain ⇄ wire conversions behind the `proto` feature, so plugin
+# binaries (which must stay lean) never link the gRPC stack.
+faultforge-proto = { path = "../proto", optional = true }
+
+[features]
+proto = ["dep:faultforge-proto"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
