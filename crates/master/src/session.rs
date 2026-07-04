@@ -5,14 +5,18 @@ use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 use tracing::{error, info, warn};
 
+use faultforge_fault::proto::from_wire_i32;
 use faultforge_proto::Hostname;
 use faultforge_proto::unix_ms;
 use faultforge_proto::v1::{
-    AgentMessage, HeartbeatAck, RegisterAck, ServerMessage, agent_message, server_message,
+    AgentMessage, HeartbeatAck, InstanceReport, InstanceStatus, RegisterAck, ServerMessage,
+    TaintStatus, agent_message, server_message,
 };
 
-use crate::clock::Clock;
-use crate::registry::{Registry, register_agent, update_heartbeat};
+use faultforge_fault::state::InstanceState;
+
+use crate::dispatch::Dispatcher;
+use crate::registry::{register_agent, update_heartbeat};
 
 // ===== Pure frame processing =====
 
@@ -56,6 +60,24 @@ fn process_heartbeat(
     }
 }
 
+/// Decode the wire state of one `InstanceStatus` into intake form. A frame
+/// whose state does not parse (unset, or a newer peer's value) is unusable —
+/// the master tracks state only from values it understands.
+fn decode_status(status: &InstanceStatus) -> Result<(String, InstanceState, String, i64), String> {
+    match from_wire_i32(status.state) {
+        Ok(state) => Ok((
+            status.instance_id.clone(),
+            state,
+            status.reason.clone(),
+            status.ts_unix_ms,
+        )),
+        Err(e) => Err(format!(
+            "instance {} carries unusable state: {e}",
+            status.instance_id
+        )),
+    }
+}
+
 // ===== Session task =====
 
 /// Whether the session loop should keep reading frames or terminate.
@@ -64,14 +86,16 @@ enum Flow {
     Stop,
 }
 
-/// Live state of one agent's bidirectional session: the shared registry/clock,
-/// the outbound reply channel, and the hostname learned from the first Register.
+/// Live state of one agent's bidirectional session: the shared dispatcher
+/// (registry, sessions, experiments), the outbound reply channel, the hostname
+/// learned from the first Register, and the session-map epoch owned by this
+/// stream.
 struct Session {
-    registry: Registry,
-    clock: Arc<dyn Clock>,
+    dispatcher: Arc<Dispatcher>,
     heartbeat_interval_secs: u32,
     tx: mpsc::Sender<Result<ServerMessage, Status>>,
     hostname: Option<Hostname>,
+    epoch: Option<u64>,
 }
 
 impl Session {
@@ -79,41 +103,36 @@ impl Session {
         match payload {
             Some(agent_message::Payload::Register(reg)) => self.register(reg.hostname).await,
             Some(agent_message::Payload::Heartbeat(_)) => self.heartbeat().await,
-            // Fault telemetry frames carry wire schema only in this slice; log each
-            // by name and keep the session open (D3: an endpoint receiving a frame it
-            // does not handle must not terminate). Kept as explicit per-variant arms so
-            // adding a new frame type breaks this match at compile time.
-            Some(agent_message::Payload::FaultEvent(_)) => {
-                warn!("ignoring FaultEvent frame (not handled in this slice)");
+            Some(agent_message::Payload::FaultEvent(event)) => {
+                // Telemetry only (design D5): operator-visible via logs, never
+                // stored, never a state input.
+                info!(instance_id = %event.instance_id, line = %event.ndjson_line, "fault event");
                 Flow::Continue
             }
-            Some(agent_message::Payload::InstanceStatus(_)) => {
-                warn!("ignoring InstanceStatus frame (not handled in this slice)");
+            Some(agent_message::Payload::InstanceStatus(status)) => {
+                self.instance_status(&status).await;
                 Flow::Continue
             }
-            Some(agent_message::Payload::InstanceReport(_)) => {
-                warn!("ignoring InstanceReport frame (not handled in this slice)");
+            Some(agent_message::Payload::InstanceReport(report)) => {
+                self.instance_report(report).await;
                 Flow::Continue
             }
-            Some(agent_message::Payload::TaintStatus(_)) => {
-                warn!("ignoring TaintStatus frame (not handled in this slice)");
+            Some(agent_message::Payload::TaintStatus(taint)) => {
+                self.taint_status(&taint).await;
                 Flow::Continue
             }
-            // An unknown or future frame variant: prost decodes an unrecognized oneof
-            // field to None. Same rule — log and keep the session open so a newer agent
-            // never tears it down.
+            // An unknown or future frame variant: prost decodes an unrecognized
+            // oneof field to None. Log and keep the session open so a newer
+            // agent never tears it down.
             None => {
-                warn!(
-                    "ignoring unknown or future agent frame \
-                     (empty payload; not handled in this slice)"
-                );
+                warn!("ignoring unknown or future agent frame (empty payload)");
                 Flow::Continue
             }
         }
     }
 
     async fn register(&mut self, hostname_str: String) -> Flow {
-        let now = self.clock.now();
+        let now = self.dispatcher.clock().now();
         match process_register(
             &hostname_str,
             self.hostname.is_some(),
@@ -121,7 +140,10 @@ impl Session {
             self.heartbeat_interval_secs,
         ) {
             Ok((h, reply)) => {
-                register_agent(&self.registry, &h, now);
+                register_agent(self.dispatcher.registry(), &h, now);
+                // Insert before the ack goes out: an agent that acts on the ack
+                // immediately must already be reachable for dispatch.
+                self.epoch = Some(self.dispatcher.sessions().insert(&h, self.tx.clone()));
                 info!(hostname = %h, "agent registered");
                 self.hostname = Some(h);
                 self.send(reply).await
@@ -131,17 +153,49 @@ impl Session {
     }
 
     async fn heartbeat(&mut self) -> Flow {
-        let now = self.clock.now();
+        let now = self.dispatcher.clock().now();
         match process_heartbeat(self.hostname.as_ref(), now) {
             Ok(reply) => {
                 if let Some(h) = self.hostname.as_ref() {
-                    update_heartbeat(&self.registry, h, now);
+                    update_heartbeat(self.dispatcher.registry(), h, now);
                     info!(hostname = %h, "heartbeat");
                 }
                 self.send(reply).await
             }
             Err(status) => self.reject(status, "heartbeat").await,
         }
+    }
+
+    async fn instance_status(&self, status: &InstanceStatus) {
+        match decode_status(status) {
+            Ok((instance_id, state, reason, ts)) => {
+                self.dispatcher
+                    .handle_instance_status(&instance_id, state, &reason, ts)
+                    .await;
+            }
+            Err(e) => warn!("dropping InstanceStatus: {e}"),
+        }
+    }
+
+    async fn instance_report(&self, report: InstanceReport) {
+        let mut statuses = vec![];
+        for status in &report.statuses {
+            match decode_status(status) {
+                Ok(decoded) => statuses.push(decoded),
+                Err(e) => warn!("dropping InstanceReport entry: {e}"),
+            }
+        }
+        self.dispatcher.handle_instance_report(statuses).await;
+    }
+
+    async fn taint_status(&self, taint: &TaintStatus) {
+        let Some(hostname) = self.hostname.as_ref() else {
+            warn!("TaintStatus before Register; dropping");
+            return;
+        };
+        self.dispatcher
+            .handle_taint_status(hostname, taint.tainted, &taint.reason, taint.ts_unix_ms)
+            .await;
     }
 
     /// Forward a successful reply; stop if the response stream has been dropped.
@@ -161,24 +215,25 @@ impl Session {
     }
 }
 
-/// Drive one agent session to completion: read frames off `stream`, dispatch each,
-/// and write replies to `tx` until the stream closes or a protocol error ends it.
+/// Drive one agent session to completion: read frames off `stream`, dispatch
+/// each, and write replies to `tx` until the stream closes or a protocol error
+/// ends it. On exit the stream removes its own session-map entry — but only
+/// while it is still the current one (supersede on reconnect, design D4).
 ///
-/// Spawned by the gRPC `session` handler; owns its registry/clock handles so the
+/// Spawned by the gRPC `session` handler; owns its dispatcher handle so the
 /// future is `'static` and `Send`.
 pub(crate) async fn run(
     mut stream: Streaming<AgentMessage>,
     tx: mpsc::Sender<Result<ServerMessage, Status>>,
-    registry: Registry,
+    dispatcher: Arc<Dispatcher>,
     heartbeat_interval_secs: u32,
-    clock: Arc<dyn Clock>,
 ) {
     let mut session = Session {
-        registry,
-        clock,
+        dispatcher,
         heartbeat_interval_secs,
         tx,
         hostname: None,
+        epoch: None,
     };
 
     loop {
@@ -196,6 +251,12 @@ pub(crate) async fn run(
             }
         }
     }
+    if let (Some(hostname), Some(epoch)) = (session.hostname.as_ref(), session.epoch) {
+        session
+            .dispatcher
+            .sessions()
+            .remove_if_current(hostname, epoch);
+    }
     info!("session closed for hostname: {:?}", session.hostname);
 }
 
@@ -204,6 +265,7 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faultforge_fault::proto::to_wire_i32;
     use faultforge_proto::Hostname;
     use faultforge_proto::v1::server_message;
     use std::time::{Duration, UNIX_EPOCH};
@@ -257,5 +319,28 @@ mod tests {
             }
             _ => panic!("expected HeartbeatAck"),
         }
+    }
+
+    #[test]
+    fn decode_status_accepts_known_states_and_rejects_unset() {
+        let good = InstanceStatus {
+            instance_id: "exp-1:h:0".into(),
+            state: to_wire_i32(InstanceState::Active),
+            ts_unix_ms: 5,
+            reason: "r".into(),
+            plugin_digest: String::new(),
+        };
+        assert_eq!(
+            decode_status(&good).unwrap(),
+            ("exp-1:h:0".into(), InstanceState::Active, "r".into(), 5)
+        );
+
+        let unset = InstanceStatus {
+            state: 0,
+            ..good.clone()
+        };
+        assert!(decode_status(&unset).is_err());
+        let unknown = InstanceStatus { state: 999, ..good };
+        assert!(decode_status(&unknown).is_err());
     }
 }

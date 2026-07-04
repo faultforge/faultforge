@@ -6,6 +6,7 @@
 use std::time::SystemTime;
 
 use crate::api::Agent;
+use crate::api::model::{Experiment, ExperimentSummary};
 use crate::cli::OutputFormat;
 
 /// Render a list of agents in the chosen format.
@@ -61,19 +62,28 @@ fn render_agent_json(agent: &Agent) -> String {
     serde_json::to_string_pretty(agent).unwrap_or_else(|e| format!("{{render error: {e}}}"))
 }
 
+/// The table cell for a host quarantine flag.
+fn taint_cell(tainted: bool) -> &'static str {
+    if tainted { "TAINTED" } else { "-" }
+}
+
 fn render_agents_table(agents: &[Agent], now: SystemTime) -> String {
     if agents.is_empty() {
         return "(no agents registered)".to_string();
     }
-    let header = format!("{:<20} {:<20} {}", "HOSTNAME", "NAME", "LAST SEEN");
+    let header = format!(
+        "{:<20} {:<20} {:<10} {}",
+        "HOSTNAME", "NAME", "TAINT", "LAST SEEN"
+    );
     let sep = "-".repeat(header.len());
     let rows: Vec<String> = agents
         .iter()
         .map(|a| {
             format!(
-                "{:<20} {:<20} {}",
+                "{:<20} {:<20} {:<10} {}",
                 a.hostname,
                 a.name,
+                taint_cell(a.tainted),
                 relative_age(now, a.last_seen)
             )
         })
@@ -87,11 +97,111 @@ fn render_agents_table(agents: &[Agent], now: SystemTime) -> String {
 
 fn render_agent_table(agent: &Agent, now: SystemTime) -> String {
     format!(
-        "hostname:  {}\nname:      {}\nlast seen: {}",
+        "hostname:  {}\nname:      {}\ntainted:   {}\nlast seen: {}",
         agent.hostname,
         agent.name,
+        agent.tainted,
         relative_age(now, agent.last_seen)
     )
+}
+
+// ===== Experiments =====
+
+/// Render an experiment list in the chosen format.
+pub fn render_experiments(
+    experiments: &[ExperimentSummary],
+    format: &OutputFormat,
+    now: SystemTime,
+) -> String {
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(experiments)
+            .unwrap_or_else(|e| format!("[render error: {e}]")),
+        OutputFormat::Table => render_experiments_table(experiments, now),
+    }
+}
+
+/// Render one experiment (full record) in the chosen format.
+pub fn render_experiment(
+    experiment: &Experiment,
+    format: &OutputFormat,
+    now: SystemTime,
+) -> String {
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(experiment)
+            .unwrap_or_else(|e| format!("{{render error: {e}}}")),
+        OutputFormat::Table => render_experiment_table(experiment, now),
+    }
+}
+
+fn ms_to_time(ms: i64) -> SystemTime {
+    u64::try_from(ms).map_or(std::time::UNIX_EPOCH, |ms| {
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+    })
+}
+
+fn render_experiments_table(experiments: &[ExperimentSummary], now: SystemTime) -> String {
+    if experiments.is_empty() {
+        return "(no experiments)".to_string();
+    }
+    let header = format!(
+        "{:<28} {:<16} {:<10} {:<10} {}",
+        "ID", "NAME", "STATE", "INSTANCES", "STARTED"
+    );
+    let sep = "-".repeat(header.len());
+    let rows: Vec<String> = experiments
+        .iter()
+        .map(|e| {
+            format!(
+                "{:<28} {:<16} {:<10} {:<10} {}",
+                e.id,
+                e.name,
+                e.state,
+                e.instances,
+                relative_age(now, ms_to_time(e.started_unix_ms))
+            )
+        })
+        .collect();
+    std::iter::once(header)
+        .chain(std::iter::once(sep))
+        .chain(rows)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_experiment_table(experiment: &Experiment, now: SystemTime) -> String {
+    let mut lines = vec![
+        format!("id:       {}", experiment.id),
+        format!("name:     {}", experiment.name),
+        format!("state:    {}", experiment.state),
+        format!("outcome:  {}", experiment.outcome.as_deref().unwrap_or("-")),
+        format!("grace:    {}s", experiment.grace_secs),
+        format!(
+            "started:  {}",
+            relative_age(now, ms_to_time(experiment.started_unix_ms))
+        ),
+    ];
+    if let Some(cause) = &experiment.cause {
+        lines.push(format!(
+            "cause:    {} (host: {}, instance: {})",
+            cause.reason,
+            cause.hostname.as_deref().unwrap_or("-"),
+            cause.instance_id.as_deref().unwrap_or("-"),
+        ));
+    }
+    lines.push(String::new());
+    let header = format!(
+        "{:<40} {:<20} {:<12} {}",
+        "INSTANCE", "HOSTNAME", "STATE", "REASON"
+    );
+    lines.push(header.clone());
+    lines.push("-".repeat(header.len()));
+    for instance in &experiment.instances {
+        lines.push(format!(
+            "{:<40} {:<20} {:<12} {}",
+            instance.instance_id, instance.hostname, instance.state, instance.reason
+        ));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -104,6 +214,7 @@ mod tests {
             hostname: hostname.to_string(),
             name: hostname.to_string(),
             last_seen: UNIX_EPOCH + Duration::from_millis(ms),
+            tainted: false,
         }
     }
 
@@ -189,5 +300,76 @@ mod tests {
         let result = render_agent(&a, &OutputFormat::Table, now_at(10_000));
         assert!(result.contains("db-01"));
         assert!(result.contains("10s ago"));
+    }
+
+    #[test]
+    fn render_agents_table_marks_taint() {
+        let mut tainted = agent("web-01", 0);
+        tainted.tainted = true;
+        let result = render_agents(&[tainted], &OutputFormat::Table, now_at(1_000));
+        assert!(result.contains("TAINTED"));
+    }
+
+    // --- Experiment rendering ---
+
+    fn experiment() -> Experiment {
+        use crate::api::model::{Cause, Instance};
+        Experiment {
+            id: "exp-1000-1".to_string(),
+            name: "it".to_string(),
+            state: "ERROR".to_string(),
+            outcome: Some("ERROR".to_string()),
+            grace_secs: 10,
+            started_unix_ms: 0,
+            deadline_unix_ms: 45_000,
+            cause: Some(Cause {
+                hostname: Some("web-01".to_string()),
+                instance_id: Some("exp-1000-1:web-01:0".to_string()),
+                reason: "instance ERROR: boom".to_string(),
+                ts_unix_ms: 2_000,
+            }),
+            instances: vec![Instance {
+                instance_id: "exp-1000-1:web-01:0".to_string(),
+                hostname: "web-01".to_string(),
+                action_index: 0,
+                state: "ERROR".to_string(),
+                reason: "boom".to_string(),
+                updated_unix_ms: 2_000,
+            }],
+        }
+    }
+
+    #[test]
+    fn render_experiment_json_round_trips() {
+        let result = render_experiment(&experiment(), &OutputFormat::Json, now_at(5_000));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["id"], "exp-1000-1");
+        assert_eq!(parsed["outcome"], "ERROR");
+        assert_eq!(parsed["instances"][0]["state"], "ERROR");
+    }
+
+    #[test]
+    fn render_experiment_table_names_the_cause_and_instances() {
+        let result = render_experiment(&experiment(), &OutputFormat::Table, now_at(5_000));
+        assert!(result.contains("state:    ERROR"));
+        assert!(result.contains("instance ERROR: boom"));
+        assert!(result.contains("exp-1000-1:web-01:0"));
+    }
+
+    #[test]
+    fn render_experiments_table_lists_rows() {
+        let summary = ExperimentSummary {
+            id: "exp-1000-1".to_string(),
+            name: "it".to_string(),
+            state: "RUNNING".to_string(),
+            outcome: None,
+            started_unix_ms: 0,
+            instances: 3,
+        };
+        let result = render_experiments(&[summary], &OutputFormat::Table, now_at(1_000));
+        assert!(result.contains("exp-1000-1"));
+        assert!(result.contains("RUNNING"));
+        let empty = render_experiments(&[], &OutputFormat::Table, now_at(0));
+        assert!(empty.contains("no experiments"));
     }
 }

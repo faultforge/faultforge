@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use faultforge_master::{MasterService, Registry, new_registry};
+use faultforge_master::clock::SystemClock;
+use faultforge_master::{Catalog, Dispatcher, MasterService, Registry, new_registry};
 use faultforge_proto::Hostname;
 use faultforge_proto::v1::{
     AgentMessage, Heartbeat, InstanceState, InstanceStatus, Register, ServerMessage, agent_message,
@@ -18,7 +19,13 @@ async fn start_test_server(heartbeat_interval_secs: u32) -> (String, Registry) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let registry = new_registry();
-    let service = MasterService::new(Arc::clone(&registry), heartbeat_interval_secs);
+    let dispatcher = Arc::new(Dispatcher::new(
+        Catalog::default(),
+        Arc::clone(&registry),
+        10,
+        Arc::new(SystemClock),
+    ));
+    let service = MasterService::new(dispatcher, heartbeat_interval_secs);
 
     tokio::spawn(async move {
         tonic::transport::Server::builder()

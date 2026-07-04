@@ -212,6 +212,54 @@ impl Supervisor {
         }
     }
 
+    /// Handle a `ClearTaint` frame: remove the taint record (idempotent — an
+    /// untainted host is already clear) and report the resulting state. A
+    /// failed removal keeps the quarantine and says why.
+    pub fn handle_clear_taint(&self) {
+        let taint = self.ctx.taint.clone();
+        let out = self.ctx.out.clone();
+        tokio::spawn(async move {
+            let cleared = {
+                let taint = taint.clone();
+                tokio::task::spawn_blocking(move || taint.clear()).await
+            };
+            let now_ms = unix_ms(SystemTime::now());
+            let frame = match cleared {
+                // Re-read instead of assuming clean: if a record somehow still
+                // exists the quarantine must fail closed.
+                Ok(Ok(())) => {
+                    info!("taint cleared by operator command");
+                    taint_status_frame(taint.current().as_ref(), now_ms)
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "could not remove taint record; host stays tainted");
+                    taint_status_frame(
+                        Some(&TaintRecord {
+                            reason: format!("taint clear failed: {e}"),
+                            ts_unix_ms: now_ms,
+                            instance_id: String::new(),
+                        }),
+                        now_ms,
+                    )
+                }
+                Err(join_err) => {
+                    warn!(error = %join_err, "taint clear task failed; host stays tainted");
+                    taint_status_frame(
+                        Some(&TaintRecord {
+                            reason: format!("taint clear task failed: {join_err}"),
+                            ts_unix_ms: now_ms,
+                            instance_id: String::new(),
+                        }),
+                        now_ms,
+                    )
+                }
+            };
+            if out.send(frame).await.is_err() {
+                debug!("outbound channel closed while reporting taint clear");
+            }
+        });
+    }
+
     /// The reconciliation snapshot sent after every registration: all live
     /// (non-terminal) instances with their states and digests. Empty is
     /// meaningful ("nothing running") and is still sent.

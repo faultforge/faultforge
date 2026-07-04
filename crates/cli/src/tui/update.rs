@@ -102,6 +102,7 @@ mod tests {
             hostname: hostname.to_string(),
             name: hostname.to_string(),
             last_seen: UNIX_EPOCH,
+            tainted: false,
         }
     }
 

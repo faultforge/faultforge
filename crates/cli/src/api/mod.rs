@@ -1,10 +1,11 @@
-//! HTTP client for the master's read-only management API.
+//! HTTP client for the master's management API (registry reads plus the
+//! experiment/taint write surface).
 
 pub mod error;
 pub mod model;
 
 pub use error::ApiError;
-pub use model::Agent;
+pub use model::{Agent, Experiment, ExperimentSummary};
 
 use std::time::Duration;
 
@@ -121,6 +122,144 @@ impl Client {
             .map_err(|e| ApiError::Decode(e.to_string()))
     }
 
+    /// Submit an experiment definition (`POST /experiments`).
+    ///
+    /// `definition` is the already-parsed JSON body (the CLI reads it from a
+    /// YAML/JSON file); the master validates it.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::Validation`] — the master rejected the definition (HTTP
+    ///   422); every failing check is listed.
+    /// - Transport/status/decode errors as for the other calls.
+    pub async fn run_experiment(
+        &self,
+        definition: &serde_json::Value,
+    ) -> Result<Experiment, ApiError> {
+        let url = self.endpoint(&["experiments"])?;
+        let response = self
+            .http
+            .post(url)
+            .json(definition)
+            .send()
+            .await
+            .map_err(|e| classify_transport(&e, &self.base_url))?;
+
+        if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+            return Err(validation_error(response).await);
+        }
+        if !response.status().is_success() {
+            return Err(status_error(response).await);
+        }
+        response
+            .json::<Experiment>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string()))
+    }
+
+    /// Fetch all experiments (`GET /experiments`). Empty when the master holds
+    /// none (including right after a master restart).
+    ///
+    /// # Errors
+    ///
+    /// Transport/status/decode errors as for [`Self::list_agents`].
+    pub async fn list_experiments(&self) -> Result<Vec<ExperimentSummary>, ApiError> {
+        let url = self.endpoint(&["experiments"])?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| classify_transport(&e, &self.base_url))?;
+        if !response.status().is_success() {
+            return Err(status_error(response).await);
+        }
+        response
+            .json::<Vec<ExperimentSummary>>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string()))
+    }
+
+    /// Fetch one experiment (`GET /experiments/{id}`).
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::NotFound`] — the master holds no such experiment.
+    /// - Transport/status/decode errors as for the other calls.
+    pub async fn get_experiment(&self, id: &str) -> Result<Experiment, ApiError> {
+        let url = self.endpoint(&["experiments", id])?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| classify_transport(&e, &self.base_url))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(ApiError::NotFound);
+        }
+        if !response.status().is_success() {
+            return Err(status_error(response).await);
+        }
+        response
+            .json::<Experiment>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string()))
+    }
+
+    /// Halt an experiment (`POST /experiments/{id}/halt`).
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::NotFound`] — no such experiment.
+    /// - [`ApiError::Conflict`] — the experiment is already terminal.
+    /// - Transport/status errors as for the other calls.
+    pub async fn halt_experiment(&self, id: &str) -> Result<(), ApiError> {
+        let url = self.endpoint(&["experiments", id, "halt"])?;
+        let response = self
+            .http
+            .post(url)
+            .send()
+            .await
+            .map_err(|e| classify_transport(&e, &self.base_url))?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Err(ApiError::NotFound),
+            StatusCode::CONFLICT => Err(ApiError::Conflict(
+                "experiment is already terminal".to_string(),
+            )),
+            status if status.is_success() => Ok(()),
+            _ => Err(status_error(response).await),
+        }
+    }
+
+    /// Clear a host's taint (`POST /agents/{hostname}/clear-taint`).
+    ///
+    /// A `202` means the command was relayed; the effect is confirmed by the
+    /// agent's next `TaintStatus` (visible via `agents show`).
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::NotFound`] — the hostname is not registered.
+    /// - [`ApiError::Conflict`] — the host has no live session.
+    /// - Transport/status errors as for the other calls.
+    pub async fn clear_taint(&self, hostname: &str) -> Result<(), ApiError> {
+        let url = self.endpoint(&["agents", hostname, "clear-taint"])?;
+        let response = self
+            .http
+            .post(url)
+            .send()
+            .await
+            .map_err(|e| classify_transport(&e, &self.base_url))?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Err(ApiError::NotFound),
+            StatusCode::CONFLICT => Err(ApiError::Conflict(
+                "host has no live session; the agent must be connected to clear its taint"
+                    .to_string(),
+            )),
+            status if status.is_success() => Ok(()),
+            _ => Err(status_error(response).await),
+        }
+    }
+
     /// Build a request URL by appending percent-encoded `segments` onto the base.
     ///
     /// Each segment is encoded as a single path segment (handling spaces and
@@ -157,6 +296,21 @@ async fn status_error(response: reqwest::Response) -> ApiError {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     ApiError::Status { status, body }
+}
+
+/// Build an [`ApiError::Validation`] from a 422 body (`{ "errors": [...] }`),
+/// consuming the response. An unparseable body degrades to its raw text so the
+/// operator still sees why the master said no.
+async fn validation_error(response: reqwest::Response) -> ApiError {
+    #[derive(serde::Deserialize)]
+    struct Errors {
+        errors: Vec<String>,
+    }
+    let body = response.text().await.unwrap_or_default();
+    match serde_json::from_str::<Errors>(&body) {
+        Ok(parsed) => ApiError::Validation(parsed.errors),
+        Err(_) => ApiError::Validation(vec![body]),
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +397,158 @@ mod tests {
             c.endpoint(&["agents", "web-01"]).unwrap().as_str(),
             "http://localhost:8069/api/agents/web-01"
         );
+    }
+
+    // ===== HTTP-mock tests (axum stand-in for the master's management API) =====
+
+    mod mock {
+        use super::super::*;
+        use axum::http::StatusCode as AxStatus;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use serde_json::json;
+
+        /// Serve `router` on an ephemeral port; return a client aimed at it.
+        async fn serve(router: Router) -> Client {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            Client::new(format!("http://{addr}")).unwrap()
+        }
+
+        fn experiment_body() -> serde_json::Value {
+            json!({
+                "id": "exp-1000-1", "name": "it", "state": "RUNNING", "outcome": null,
+                "grace_secs": 10, "started_unix_ms": 1000, "deadline_unix_ms": 46000,
+                "cause": null,
+                "instances": [{"instance_id": "exp-1000-1:web-01:0", "hostname": "web-01",
+                               "action_index": 0, "state": "PENDING", "reason": "",
+                               "updated_unix_ms": 1000}]
+            })
+        }
+
+        #[tokio::test]
+        async fn run_experiment_returns_the_created_record() {
+            let router = Router::new().route(
+                "/experiments",
+                post(|| async { (AxStatus::CREATED, Json(experiment_body())) }),
+            );
+            let client = serve(router).await;
+            let experiment = client.run_experiment(&json!({"name": "it"})).await.unwrap();
+            assert_eq!(experiment.id, "exp-1000-1");
+            assert_eq!(experiment.instances[0].state, "PENDING");
+            assert!(!experiment.is_terminal());
+        }
+
+        #[tokio::test]
+        async fn run_experiment_maps_422_to_validation_with_all_reasons() {
+            let router = Router::new().route(
+                "/experiments",
+                post(|| async {
+                    (
+                        AxStatus::UNPROCESSABLE_ENTITY,
+                        Json(json!({"errors": ["unknown plugin ghost@1", "host 'x' is TAINTED"]})),
+                    )
+                }),
+            );
+            let client = serve(router).await;
+            let err = client.run_experiment(&json!({})).await.unwrap_err();
+            match err {
+                ApiError::Validation(errors) => {
+                    assert_eq!(errors.len(), 2);
+                    assert!(errors[0].contains("unknown plugin"));
+                }
+                other => panic!("expected Validation, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn halt_maps_202_404_409() {
+            let router = Router::new()
+                .route(
+                    "/experiments/exp-ok/halt",
+                    post(|| async { AxStatus::ACCEPTED }),
+                )
+                .route(
+                    "/experiments/exp-done/halt",
+                    post(|| async { AxStatus::CONFLICT }),
+                );
+            let client = serve(router).await;
+            client.halt_experiment("exp-ok").await.unwrap();
+            assert!(matches!(
+                client.halt_experiment("exp-done").await.unwrap_err(),
+                ApiError::Conflict(_)
+            ));
+            assert!(matches!(
+                client.halt_experiment("exp-missing").await.unwrap_err(),
+                ApiError::NotFound
+            ));
+        }
+
+        #[tokio::test]
+        async fn clear_taint_maps_202_404_409() {
+            let router = Router::new()
+                .route(
+                    "/agents/web-01/clear-taint",
+                    post(|| async { AxStatus::ACCEPTED }),
+                )
+                .route(
+                    "/agents/gone-01/clear-taint",
+                    post(|| async { AxStatus::CONFLICT }),
+                );
+            let client = serve(router).await;
+            client.clear_taint("web-01").await.unwrap();
+            assert!(matches!(
+                client.clear_taint("gone-01").await.unwrap_err(),
+                ApiError::Conflict(_)
+            ));
+            assert!(matches!(
+                client.clear_taint("nope-01").await.unwrap_err(),
+                ApiError::NotFound
+            ));
+        }
+
+        #[tokio::test]
+        async fn experiments_list_get_and_missing() {
+            let router = Router::new()
+                .route(
+                    "/experiments",
+                    get(|| async {
+                        Json(json!([{"id": "exp-1", "name": "it", "state": "COMPLETED",
+                                     "outcome": "COMPLETED", "started_unix_ms": 1,
+                                     "instances": 2}]))
+                    }),
+                )
+                .route(
+                    "/experiments/exp-1",
+                    get(|| async { Json(experiment_body()) }),
+                );
+            let client = serve(router).await;
+            let list = client.list_experiments().await.unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].outcome.as_deref(), Some("COMPLETED"));
+            let experiment = client.get_experiment("exp-1").await.unwrap();
+            assert_eq!(experiment.id, "exp-1000-1");
+            assert!(matches!(
+                client.get_experiment("exp-2").await.unwrap_err(),
+                ApiError::NotFound
+            ));
+        }
+
+        #[tokio::test]
+        async fn agents_carry_the_taint_flag() {
+            let router = Router::new().route(
+                "/agents",
+                get(|| async {
+                    Json(json!([{"hostname": "web-01", "name": "web-01",
+                                 "last_seen_unix_ms": 1000, "tainted": true}]))
+                }),
+            );
+            let client = serve(router).await;
+            let agents = client.list_agents().await.unwrap();
+            assert!(agents[0].tainted);
+        }
     }
 }

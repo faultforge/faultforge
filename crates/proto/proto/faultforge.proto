@@ -67,10 +67,9 @@ message ServerMessage {
   oneof payload {
     RegisterAck register_ack = 1;
     HeartbeatAck heartbeat_ack = 2;
-    // Fault control (wire schema only in implement-fault-schema; the master does
-    // not yet issue these — behaviour arrives in master-fault-dispatch).
     RunFault run_fault = 3;
     AbortFault abort_fault = 4;
+    ClearTaint clear_taint = 5;
   }
 }
 
@@ -101,6 +100,12 @@ message RunFault {
 message AbortFault {
   string instance_id = 1;
 }
+
+// The operator's command to clear the host taint (ADR-0002 decision 9: a human
+// clears the taint; the master only relays). Deliberately empty: the target
+// host is the session the frame travels on, and the agent answers with a
+// TaintStatus reporting the resulting state.
+message ClearTaint {}
 
 // ===== Shared enums =====
 

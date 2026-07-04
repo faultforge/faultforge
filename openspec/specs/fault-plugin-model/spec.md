@@ -7,9 +7,7 @@ recoverable lifecycle (v1 scope). This is the agent/plugin half of the fault sys
 independent of the master-side experiment model. Includes the concrete invocation contract and
 wire schema for plugin communication. Governing decisions:
 [ADR-0002](../../../docs/adr/0002-fault-model-decisions.md).
-
 ## Requirements
-
 ### Requirement: A plugin is described by a machine-readable manifest
 A plugin SHALL consist of a manifest plus an executable entrypoint. The manifest SHALL declare the
 plugin identity (`name`, `version`), the `entrypoint`, a `params_schema`, a `requires` block
@@ -298,12 +296,14 @@ bytes. Multiple versions of a plugin SHALL be installable side by side.
 
 The wire contract SHALL define, on the existing `Session` stream: master→agent `RunFault`
 (`instance_id`, `plugin_name`, `plugin_version`, `plugin_digest`, `params_json`, `duration_secs`,
-`grace_secs`) and `AbortFault` (`instance_id`); agent→master `FaultEvent` (`instance_id` plus the
-verbatim plugin NDJSON line), `InstanceStatus` (agent-authoritative transition: state, timestamp,
-optional reason), `InstanceReport` (reconciliation snapshot of instance statuses), and
-`TaintStatus` (host quarantine state and reason). `grace_secs` SHALL be decided by the master and
-carried in `RunFault`. An endpoint receiving a fault frame it does not handle SHALL log it and
-continue the session rather than terminating.
+`grace_secs`), `AbortFault` (`instance_id`), and `ClearTaint` (no fields — the target host is
+the session the frame travels on, and the frame carries the operator's command to clear the
+host's taint); agent→master `FaultEvent` (`instance_id` plus the verbatim plugin NDJSON line),
+`InstanceStatus` (agent-authoritative transition: state, timestamp, optional reason, and the
+`plugin_digest` the agent verified for the instance), `InstanceReport` (reconciliation snapshot
+of instance statuses), and `TaintStatus` (host quarantine state and reason). `grace_secs` SHALL
+be decided by the master and carried in `RunFault`. An endpoint receiving a fault frame it
+does not handle SHALL log it and continue the session rather than terminating.
 
 #### Scenario: RunFault carries everything the agent needs
 
@@ -315,3 +315,16 @@ continue the session rather than terminating.
 
 - **WHEN** a master or agent that does not yet implement fault behaviour receives a fault frame
 - **THEN** it SHALL log the frame and keep the `Session` stream open
+
+#### Scenario: Agent-authoritative statuses identify the verified plugin
+
+- **WHEN** the agent emits an `InstanceStatus` transition or an `InstanceReport` snapshot entry
+- **THEN** the frame SHALL carry the `plugin_digest` the agent verified for that instance, so
+  reconciliation and audit can tie the reported state to the exact plugin bytes
+
+#### Scenario: ClearTaint addresses the session's host
+
+- **WHEN** the master sends `ClearTaint` on a host's `Session` stream
+- **THEN** the frame SHALL carry no addressing fields and SHALL apply to the host behind that
+  session
+

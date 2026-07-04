@@ -43,50 +43,53 @@ default `management_listen_addr` to `127.0.0.1:8069`.
   of the default
 
 ### Requirement: List all registered agents
-The management API SHALL expose `GET /agents` returning every agent currently in
-the registry. Each agent SHALL be represented as a JSON object with `hostname`,
-`name`, and `last_seen_unix_ms` (the raw last-seen timestamp in Unix
-milliseconds). The endpoint SHALL return an empty JSON array when no agents are
-registered.
+The management API SHALL expose `GET /agents` returning every agent currently in the registry.
+Each agent SHALL be represented as a JSON object with `hostname`, `name`, `last_seen_unix_ms`
+(the raw last-seen timestamp in Unix milliseconds), and `tainted` (boolean — the host quarantine
+state most recently reported by the agent's `TaintStatus`, `false` when never reported). The
+endpoint SHALL return an empty JSON array when no agents are registered.
 
 #### Scenario: Registry contains agents
-- **WHEN** a client sends `GET /agents` and the registry contains one or more
-  agents
-- **THEN** the master SHALL respond with `200 OK` and a JSON array containing one
-  object per registered agent, each with `hostname`, `name`, and
-  `last_seen_unix_ms`
+- **WHEN** a client sends `GET /agents` and the registry contains one or more agents
+- **THEN** the master SHALL respond with `200 OK` and a JSON array containing one object per
+  registered agent, each with `hostname`, `name`, `last_seen_unix_ms`, and `tainted`
 
 #### Scenario: Registry is empty
 - **WHEN** a client sends `GET /agents` and the registry contains no agents
 - **THEN** the master SHALL respond with `200 OK` and an empty JSON array
 
+#### Scenario: Tainted host is visible
+- **WHEN** an agent has reported `TaintStatus { tainted: true }` and a client sends `GET /agents`
+- **THEN** that agent's object SHALL carry `tainted: true`
+
 ### Requirement: Fetch a single agent by hostname
-The management API SHALL expose `GET /agents/{hostname}` returning the registry
-record for the given hostname as a JSON object with `hostname`, `name`, and
-`last_seen_unix_ms`. When no agent is registered under that hostname, the endpoint
-SHALL respond with `404 Not Found`.
+The management API SHALL expose `GET /agents/{hostname}` returning the registry record for the
+given hostname as a JSON object with `hostname`, `name`, `last_seen_unix_ms`, and `tainted`.
+When no agent is registered under that hostname, the endpoint SHALL respond with `404 Not
+Found`.
 
 #### Scenario: Agent exists
-- **WHEN** a client sends `GET /agents/web-01` and an agent is registered under
-  `web-01`
-- **THEN** the master SHALL respond with `200 OK` and a JSON object containing
-  `hostname`, `name`, and `last_seen_unix_ms` for `web-01`
+- **WHEN** a client sends `GET /agents/web-01` and an agent is registered under `web-01`
+- **THEN** the master SHALL respond with `200 OK` and a JSON object containing `hostname`,
+  `name`, `last_seen_unix_ms`, and `tainted` for `web-01`
 
 #### Scenario: Agent does not exist
-- **WHEN** a client sends `GET /agents/unknown-host` and no agent is registered
-  under `unknown-host`
+- **WHEN** a client sends `GET /agents/unknown-host` and no agent is registered under
+  `unknown-host`
 - **THEN** the master SHALL respond with `404 Not Found`
 
-### Requirement: Management API is read-only and unauthenticated during WIP
-The management API SHALL NOT expose any endpoint that mutates agent state, and
-SHALL NOT require authentication or TLS during the WIP phase. All exposed
-endpoints SHALL be safe HTTP reads.
-
-#### Scenario: No write endpoints are exposed
-- **WHEN** a client issues a mutating request (e.g. `POST`, `PUT`, `DELETE`) to an
-  agent path
-- **THEN** the master SHALL NOT modify any registry state in response
+### Requirement: Management API is unauthenticated during WIP with writes limited to fault dispatch
+The management API SHALL NOT require authentication or TLS during the WIP phase. Mutating
+endpoints SHALL be limited to the fault-dispatch surface defined by the `master-fault-dispatch`
+capability (experiment run/halt, clear-taint); agent registry entries themselves SHALL remain
+unmodifiable through the API. The deployment documentation SHALL state that the management
+address must not be exposed beyond a trusted network while unauthenticated.
 
 #### Scenario: Requests are served without credentials
-- **WHEN** a client sends `GET /agents` without any authentication credentials
+- **WHEN** a client sends any management request without authentication credentials
 - **THEN** the master SHALL serve the request normally
+
+#### Scenario: Registry entries are not directly mutable
+- **WHEN** a client issues a mutating request against an agent path other than the documented
+  fault-dispatch endpoints (e.g. `DELETE /agents/web-01`)
+- **THEN** the master SHALL NOT modify any registry state in response
