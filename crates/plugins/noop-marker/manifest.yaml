@@ -1,0 +1,11 @@
+name: noop-marker
+version: "1"
+entrypoint: ./noop-marker
+params_schema:
+  marker_path: string
+requires:
+  binaries: []
+  privileges: []
+  preconditions:
+    - marker_dir_writable
+max_duration_secs: 600

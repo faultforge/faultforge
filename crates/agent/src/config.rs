@@ -33,7 +33,6 @@ pub fn load_config(cli: &Cli) -> Result<AgentConfig, config::ConfigError> {
             .required(cli.config.is_some()),
     );
 
-    // Env var: FAULTFORGE_MASTER_ADDR
     // No .separator() so field names with underscores are matched literally.
     builder = builder.add_source(Environment::with_prefix("FAULTFORGE").try_parsing(true));
 
@@ -50,7 +49,6 @@ pub fn load_config(cli: &Cli) -> Result<AgentConfig, config::ConfigError> {
 mod tests {
     use super::*;
 
-    // Task 4.3: AgentConfig loading fails with clear error when master_addr is absent
     #[test]
     fn missing_master_addr_fails() {
         let result = Config::builder()

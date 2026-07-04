@@ -33,7 +33,6 @@ fn main() -> anyhow::Result<()> {
                 runtime.block_on(tui::run(client))?;
                 script::EXIT_OK
             } else {
-                // Not a TTY and no subcommand: print help to stderr and exit non-zero.
                 let mut cmd = <Cli as clap::CommandFactory>::command();
                 cmd.write_help(&mut std::io::stderr())?;
                 eprintln!();

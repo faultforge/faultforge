@@ -6,10 +6,18 @@ service AgentService {
   rpc Session(stream AgentMessage) returns (stream ServerMessage);
 }
 
+// ===== Agent -> master =====
+
 message AgentMessage {
   oneof payload {
     Register register = 1;
     Heartbeat heartbeat = 2;
+    // Fault telemetry (wire schema only in implement-fault-schema; the agent does
+    // not yet emit these — behaviour arrives in agent-fault-runtime).
+    FaultEvent fault_event = 3;
+    InstanceStatus instance_status = 4;
+    InstanceReport instance_report = 5;
+    TaintStatus taint_status = 6;
   }
 }
 
@@ -19,10 +27,46 @@ message Register {
 
 message Heartbeat {}
 
+// A plugin's NDJSON stdout line, forwarded verbatim so operators get full
+// fidelity. The master must NOT drive lifecycle state from these; that comes only
+// from InstanceStatus.
+message FaultEvent {
+  string instance_id = 1;
+  string ndjson_line = 2;
+}
+
+// An agent-authoritative lifecycle transition. This is the only track the master
+// tracks instance state from.
+message InstanceStatus {
+  string instance_id = 1;
+  InstanceState state = 2;
+  int64 ts_unix_ms = 3;
+  string reason = 4; // optional, may be empty
+}
+
+// A reconciliation snapshot: the current status of each instance the agent
+// supervises.
+message InstanceReport {
+  repeated InstanceStatus statuses = 1;
+}
+
+// Host-level quarantine state (decision 9). Distinct from any instance state.
+message TaintStatus {
+  bool tainted = 1;
+  string reason = 2;
+  int64 ts_unix_ms = 3;
+}
+
+// ===== Master -> agent =====
+
 message ServerMessage {
   oneof payload {
     RegisterAck register_ack = 1;
     HeartbeatAck heartbeat_ack = 2;
+    // Fault control (wire schema only in implement-fault-schema; the master does
+    // not yet issue these — behaviour arrives in master-fault-dispatch).
+    RunFault run_fault = 3;
+    AbortFault abort_fault = 4;
   }
 }
 
@@ -34,3 +78,50 @@ message RegisterAck {
 message HeartbeatAck {
   int64 server_time_unix_ms = 1;
 }
+
+// Everything the agent needs to run one fault instance. params_json is a JSON
+// string (not map<string,string>) so non-string param types stay expressible;
+// both ends validate it against the manifest params_schema with the same pure
+// function. grace_secs is decided by the master, exactly like heartbeat cadence;
+// the agent computes deadline_unix = start + duration + grace.
+message RunFault {
+  string instance_id = 1;
+  string plugin_name = 2;
+  string plugin_version = 3;
+  string plugin_digest = 4;
+  string params_json = 5;
+  uint32 duration_secs = 6;
+  uint32 grace_secs = 7;
+}
+
+message AbortFault {
+  string instance_id = 1;
+}
+
+// ===== Shared enums =====
+
+// The lifecycle state of a fault instance. Zero value is UNSPECIFIED per proto3
+// convention. Value names are prefixed so future enums can reuse bare words.
+enum InstanceState {
+  INSTANCE_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATE_PENDING = 1;
+  INSTANCE_STATE_PREFLIGHT = 2;
+  INSTANCE_STATE_INJECTING = 3;
+  INSTANCE_STATE_ACTIVE = 4;
+  INSTANCE_STATE_RECOVERING = 5;
+  INSTANCE_STATE_DONE = 6;
+  INSTANCE_STATE_ABORTED = 7;
+  INSTANCE_STATE_ERROR = 8;
+}
+
+// ===== Reserved for v2 (ADR-0002 §4) =====
+//
+// Content-addressed plugin distribution is deliberately deferred. The shape is
+// recorded here — but NOT declared as an RPC — so v1 advertises no fetch surface
+// and forces no UNIMPLEMENTED stub on the master. When dynamic pull lands (gated
+// on signing + auth), add to AgentService:
+//
+//   rpc FetchArtifact(FetchArtifactRequest) returns (stream ArtifactChunk);
+//
+//   message FetchArtifactRequest { string plugin_digest = 1; }
+//   message ArtifactChunk { bytes data = 1; }

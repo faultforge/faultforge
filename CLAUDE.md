@@ -5,14 +5,22 @@ Chaos-engineering platform for **bare-metal** hosts: a central **master** (contr
 
 ## Current state
 
-Cargo workspace, 4 crates:
+Cargo workspace, 6 crates:
 
 | Crate | Bin | Status | Role |
 |-------|-----|--------|------|
-| `crates/proto` | — | **built** | Shared gRPC contract; `build.rs` compiles `proto/faultforge.proto` |
+| `crates/proto` | — | **built** | Shared gRPC contract; `build.rs` compiles `proto/faultforge.proto`. Carries the fault wire schema (`RunFault`/`AbortFault`, `FaultEvent`/`InstanceStatus`/`InstanceReport`/`TaintStatus`, `InstanceState`) — **contract-only, no behaviour yet** (see below) |
+| `crates/fault` | — | **built** | Shared fault contract (`faultforge-fault`): manifest parsing/validation, params schema, agent↔plugin invocation protocol (stdin JSON, NDJSON events, exit-code table), lifecycle states, sha256 digest, catalog layout. Sync, no tonic/tokio |
 | `crates/master` | `faultforge-master` | **built (slice 1)** | Two planes over one registry: gRPC agent server + read-only HTTP management API; in-memory hostname registry, layered config |
 | `crates/agent` | `faultforge-agent` | **built (slice 1)** | Dials master, register/heartbeat loop, layered config |
 | `crates/cli` | `faultforge` | **built** | Operator CLI — one-shot scripting (`agents list/show`) + interactive TUI |
+| `crates/plugins/noop-marker` | `noop-marker` | **built** | Reference fault plugin: zero-blast-radius fault whose only effect is a marker file's existence. Proves the `faultforge-fault` contract with golden tests |
+
+**Fault schema is contract-only.** The fault wire frames and the `faultforge-fault` crate define the
+contract and are proven by `noop-marker`, but nothing executes faults yet: the agent does not run
+plugins and the master does not dispatch. Both session planes gain log-and-continue arms for the new
+oneof variants (an endpoint receiving an unhandled fault frame logs it and keeps the stream open) but
+neither changes behaviour. Fault execution arrives in the `agent-fault-runtime` change.
 
 ## Commands
 
@@ -45,6 +53,13 @@ cargo run -p faultforge -- agents show <hostname>
 ## Coding standards
 Before writing or modifying any Rust, read [CONVENTIONS.md](CONVENTIONS.md) and follow it. Treat its rules as mandatory, not advisory
 Rationale: [docs/adr/0001-coding-standards.md](docs/adr/0001-coding-standards.md).
+
+**Comments explain WHY, never WHAT** ([CONVENTIONS.md §4](CONVENTIONS.md#4-comments-explain-why-never-what)):
+a comment is justified only when it explains *why*, adds context the code can't show (spec/ADR
+reference, caller invariant, non-obvious consequence), or flags a hack/gotcha. Never write a comment
+that narrates what the next lines do — the code should be self-explanatory; if it isn't, fix the
+code, don't annotate it. `///` doc-comments on public items are the exception: they are required API
+documentation and are kept.
 
 ## Architecture (slice 1 — register + heartbeat)
 

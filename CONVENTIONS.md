@@ -70,19 +70,34 @@ async fn next_state(state: AgentState, event: Event) -> AgentState {
 
 ---
 
-## 4. Comments explain WHY
+## 4. Comments explain WHY, never WHAT
 
-`///` doc-comments are required on all public items and must describe the contract (preconditions,
-error conditions, invariants). Inline `//` only for non-obvious rationale. Never restate what
-the code already says.
+Code must be self-explanatory: clear names and small functions carry the *what*. A comment earns
+its place **only** when it does one of three things the code cannot:
+
+1. explains **why** — the rationale, trade-off, or decision behind the code;
+2. adds **context** the code cannot show — a reference to a spec/ADR/decision, an invariant a caller
+   must uphold, a non-obvious consequence;
+3. flags a **hack or gotcha** — a workaround, a footgun, why an error is deliberately ignored.
+
+Anything that merely narrates the next line(s) — "send the register frame", "loop over the items",
+"read the config" — is noise: **delete it and let the code speak.** If the code isn't clear enough
+to stand alone, fix the code (rename, restructure), don't annotate it.
+
+`///` doc-comments are **required** on all public items and must describe the contract
+(preconditions, error conditions, invariants) — these are API documentation, not narration, and are
+kept even when short. Inline `//` follows the three-reason test above.
 
 ```rust
-// Good
+// Good — the doc states the contract; the inline note gives a reason the code can't
 /// Returns `true` if the agent has not sent a heartbeat within `STALE_THRESHOLD`.
 /// `now` must be monotonically non-decreasing across calls for the result to be meaningful.
-fn is_stale(entry: &ConnInfo, now: SystemTime) -> bool { ... }
+fn is_stale(entry: &ConnInfo, now: SystemTime) -> bool {
+    // Saturating: a clock that jumped backwards must not read as "fresh".
+    now.duration_since(entry.last_seen).map_or(true, |d| d > STALE_THRESHOLD)
+}
 
-// Bad — restates the code, says nothing about the contract
+// Bad — restates the code, says nothing the code doesn't
 // Check if the entry is stale
 fn is_stale(entry: &ConnInfo, now: SystemTime) -> bool { ... }
 ```

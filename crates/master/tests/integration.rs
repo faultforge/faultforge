@@ -5,7 +5,7 @@ use std::sync::Arc;
 use faultforge_master::{MasterService, Registry, new_registry};
 use faultforge_proto::Hostname;
 use faultforge_proto::v1::{
-    AgentMessage, Heartbeat, Register, ServerMessage, agent_message,
+    AgentMessage, Heartbeat, InstanceState, InstanceStatus, Register, ServerMessage, agent_message,
     agent_service_client::AgentServiceClient, agent_service_server::AgentServiceServer,
     server_message,
 };
@@ -97,13 +97,11 @@ async fn connect_and_register(
     (tx, inbound)
 }
 
-// Task 6.1: agent registers, registry entry appears with name == hostname, heartbeat updates last_seen
 #[tokio::test]
 async fn agent_registers_and_heartbeats_update_last_seen() {
     let (addr, registry) = start_test_server(1).await;
     let (tx, mut inbound) = connect_and_register(&addr, "web-01").await;
 
-    // Verify registry entry: name == hostname
     let seen_after_register = {
         let reg = registry.lock().unwrap();
         let entry = reg
@@ -113,7 +111,6 @@ async fn agent_registers_and_heartbeats_update_last_seen() {
         entry.last_seen
     };
 
-    // Send a heartbeat and verify last_seen advances
     tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
     tx.send(heartbeat_frame()).await.unwrap();
 
@@ -135,13 +132,11 @@ async fn agent_registers_and_heartbeats_update_last_seen() {
     );
 }
 
-// Task 6.3: heartbeat sent before register → FailedPrecondition status, stream closes
 #[tokio::test]
 async fn heartbeat_before_register_fails_with_precondition() {
     let (addr, _registry) = start_test_server(1).await;
     let (tx, mut inbound) = connect_and_open_session(&addr).await;
 
-    // Send Heartbeat as the very first frame, skipping Register.
     tx.send(heartbeat_frame()).await.unwrap();
 
     let err = inbound
@@ -157,7 +152,6 @@ async fn heartbeat_before_register_fails_with_precondition() {
     );
 }
 
-// Task 6.2: second Register for same hostname on a new stream supersedes the first entry
 #[tokio::test]
 async fn second_register_supersedes_first_entry() {
     let (addr, registry) = start_test_server(1).await;
@@ -175,10 +169,8 @@ async fn second_register_supersedes_first_entry() {
     // Small delay so SystemTime advances
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
-    // Second connection — same hostname
     let (_tx2, _inbound2) = connect_and_register(&addr, "web-01").await;
 
-    // Registry must still have exactly one entry; last_seen updated by second registration
     let reg = registry.lock().unwrap();
     assert_eq!(
         reg.len(),
@@ -193,13 +185,11 @@ async fn second_register_supersedes_first_entry() {
     );
 }
 
-// Duplicate Register on the same stream → FailedPrecondition; second hostname never enters registry.
 #[tokio::test]
 async fn duplicate_register_on_same_stream_is_rejected() {
     let (addr, registry) = start_test_server(1).await;
     let (tx, mut inbound) = connect_and_register(&addr, "web-01").await;
 
-    // Second Register on the same stream — must be rejected.
     tx.send(register_frame("db-01")).await.unwrap();
     let err = inbound
         .message()
@@ -213,14 +203,59 @@ async fn duplicate_register_on_same_stream_is_rejected() {
         err.message()
     );
 
-    // "db-01" must never have been inserted into the registry.
     assert!(
         registry.lock().unwrap().get(&hostname("db-01")).is_none(),
         "db-01 must not appear in the registry after a rejected duplicate Register"
     );
 }
 
-// Register with empty hostname → InvalidArgument; registry stays empty.
+// D3: an agent→master fault telemetry frame the master does not handle in this
+// slice is logged and ignored; the Session stream stays open and still acks.
+#[tokio::test]
+async fn fault_frame_does_not_kill_session() {
+    let (addr, _registry) = start_test_server(1).await;
+    let (tx, mut inbound) = connect_and_register(&addr, "web-01").await;
+
+    // Send an InstanceStatus frame — valid wire, but unhandled behaviour here.
+    tx.send(AgentMessage {
+        payload: Some(agent_message::Payload::InstanceStatus(InstanceStatus {
+            instance_id: "exp1-web01-0".to_string(),
+            state: InstanceState::Active as i32,
+            ts_unix_ms: 1,
+            reason: String::new(),
+        })),
+    })
+    .await
+    .unwrap();
+
+    tx.send(heartbeat_frame()).await.unwrap();
+    let msg = inbound.message().await.unwrap().unwrap();
+    assert!(
+        matches!(msg.payload, Some(server_message::Payload::HeartbeatAck(_))),
+        "session must survive an unhandled fault frame and keep acking heartbeats"
+    );
+}
+
+// D3 / forward compatibility: a frame whose oneof payload is empty — exactly how
+// prost decodes a variant added by a newer agent than this master — must be logged
+// and skipped, not close the session.
+#[tokio::test]
+async fn unknown_frame_does_not_kill_session() {
+    let (addr, _registry) = start_test_server(1).await;
+    let (tx, mut inbound) = connect_and_register(&addr, "web-01").await;
+
+    // An AgentMessage with no known payload stands in for a future frame variant
+    // this master build does not recognize (prost decodes it to `payload: None`).
+    tx.send(AgentMessage { payload: None }).await.unwrap();
+
+    tx.send(heartbeat_frame()).await.unwrap();
+    let msg = inbound.message().await.unwrap().unwrap();
+    assert!(
+        matches!(msg.payload, Some(server_message::Payload::HeartbeatAck(_))),
+        "session must survive an unknown/future frame and keep acking heartbeats"
+    );
+}
+
 #[tokio::test]
 async fn register_with_empty_hostname_is_rejected() {
     let (addr, registry) = start_test_server(1).await;
