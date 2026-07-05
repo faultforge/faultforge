@@ -197,10 +197,13 @@ pub struct ManagementState {
 /// `GET /agents` — list every registered agent as a JSON array (empty when none).
 #[allow(clippy::needless_pass_by_value)] // axum requires extractors taken by value
 async fn list_agents(State(state): State<ManagementState>) -> Json<Vec<AgentView>> {
-    let views = lock_poison_free(&state.registry)
+    let mut views: Vec<AgentView> = lock_poison_free(&state.registry)
         .values()
         .map(agent_view)
         .collect();
+    // Stable, hostname-sorted order: HashMap iteration is nondeterministic, so
+    // without this the fleet view and CLI reshuffle between requests.
+    views.sort_by(|a, b| a.hostname.cmp(&b.hostname));
     Json(views)
 }
 
@@ -394,5 +397,27 @@ mod tests {
         let clone = state.clone();
         assert!(Arc::ptr_eq(&state.registry, &clone.registry));
         assert!(Arc::ptr_eq(&state.dispatcher, &clone.dispatcher));
+    }
+
+    #[tokio::test]
+    async fn list_agents_returns_hostname_sorted_order() {
+        let registry = new_registry();
+        let now = UNIX_EPOCH + Duration::from_secs(1);
+        for host in ["web-03", "web-01", "web-02"] {
+            crate::registry::register_agent(&registry, &Hostname::parse(host).unwrap(), now);
+        }
+        let dispatcher = Arc::new(Dispatcher::new(
+            crate::catalog::Catalog::default(),
+            Arc::clone(&registry),
+            10,
+            Arc::new(crate::clock::SystemClock),
+        ));
+        let state = ManagementState {
+            registry,
+            dispatcher,
+        };
+        let Json(views) = list_agents(State(state)).await;
+        let hostnames: Vec<&str> = views.iter().map(|v| v.hostname.as_str()).collect();
+        assert_eq!(hostnames, ["web-01", "web-02", "web-03"]);
     }
 }

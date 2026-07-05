@@ -133,6 +133,29 @@ async fn management_api_exposes_registered_agent() {
 }
 
 #[tokio::test]
+async fn management_api_lists_agents_in_hostname_sorted_order() {
+    let (grpc_url, management_url, _registry) = start_servers().await;
+
+    for host in ["web-03", "web-01", "web-02"] {
+        register_agent_over_grpc(&grpc_url, host).await;
+    }
+
+    let list: Vec<serde_json::Value> = reqwest::Client::new()
+        .get(format!("{management_url}/agents"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hostnames: Vec<&str> = list
+        .iter()
+        .map(|a| a["hostname"].as_str().unwrap())
+        .collect();
+    assert_eq!(hostnames, ["web-01", "web-02", "web-03"]);
+}
+
+#[tokio::test]
 async fn management_api_returns_empty_array_when_no_agents() {
     let (_grpc_url, management_url, _registry) = start_servers().await;
 
