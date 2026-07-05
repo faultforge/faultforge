@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [ "crates/agent", "crates/cli", "crates/fault", "crates/master", "crates/plugins/noop-marker", "crates/proto"]
+members = [ "crates/agent", "crates/cli", "crates/e2e", "crates/fault", "crates/master", "crates/plugins/noop-marker", "crates/proto"]
 
 [workspace.package]
 version = "0.1.0"

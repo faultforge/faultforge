@@ -1,0 +1,57 @@
+# Multi-stage build for the e2e harness. One shared `builder` stage compiles all
+# binaries and assembles the plugin catalog ONCE; the master and agent runtime
+# stages copy that same catalog, so its bytes — and therefore the plugin digests
+# the master sends and the agent verifies — are identical (design D2). Build a
+# target with: podman build --target <master-runtime|agent-runtime> -f containers/Containerfile .
+
+# ===== shared builder =====
+FROM docker.io/library/rust:1.96-bookworm AS builder
+WORKDIR /src
+# .containerignore keeps target/ and .git out of the context.
+COPY . .
+RUN cargo build --release -p faultforge-master -p faultforge-agent -p noop-marker
+
+# Assemble the on-disk catalog: <name>@<version>/{manifest.yaml, entrypoint}.
+RUN set -eux; \
+    mkdir -p /catalog/noop-marker@1 /catalog/hang-cleanup@1; \
+    cp crates/plugins/noop-marker/manifest.yaml   /catalog/noop-marker@1/manifest.yaml; \
+    cp target/release/noop-marker                 /catalog/noop-marker@1/noop-marker; \
+    cp containers/hang-cleanup/manifest.yaml      /catalog/hang-cleanup@1/manifest.yaml; \
+    cp containers/hang-cleanup/hang-cleanup.sh    /catalog/hang-cleanup@1/hang-cleanup.sh; \
+    chmod +x /catalog/hang-cleanup@1/hang-cleanup.sh
+
+# ===== master runtime =====
+FROM docker.io/library/debian:bookworm-slim AS master-runtime
+COPY --from=builder /src/target/release/faultforge-master /usr/local/bin/faultforge-master
+COPY --from=builder /catalog /usr/lib/faultforge/plugins
+# Bind on 0.0.0.0 so the agent (container network) and the harness (mapped port)
+# can reach the two planes; compress timings for second-scale scenarios (D4).
+ENV FAULTFORGE_LISTEN_ADDR=0.0.0.0:50051 \
+    FAULTFORGE_MANAGEMENT_LISTEN_ADDR=0.0.0.0:8069 \
+    FAULTFORGE_CATALOG_ROOT=/usr/lib/faultforge/plugins \
+    FAULTFORGE_HEARTBEAT_INTERVAL_SECS=1 \
+    FAULTFORGE_DEFAULT_GRACE_SECS=3 \
+    RUST_LOG=info
+EXPOSE 50051 8069
+CMD ["faultforge-master"]
+
+# ===== agent runtime =====
+FROM docker.io/library/debian:bookworm-slim AS agent-runtime
+COPY --from=builder /src/target/release/faultforge-agent /usr/local/bin/faultforge-agent
+COPY --from=builder /catalog /usr/lib/faultforge/plugins
+# Unprivileged agent (design D3): create the user and pre-create+chown data_dir
+# so a fresh named volume inherits agent ownership by copy-up. Running as this
+# user is what lets the taint scenario break cleanup with a root `chmod 000`.
+RUN useradd --system --create-home --uid 1000 agent \
+ && mkdir -p /var/lib/faultforge \
+ && chown -R agent:agent /var/lib/faultforge
+ENV FAULTFORGE_PLUGIN_ROOT=/usr/lib/faultforge/plugins \
+    FAULTFORGE_DATA_DIR=/var/lib/faultforge \
+    FAULTFORGE_MASTER_LOSS_THRESHOLD_SECS=5 \
+    # Compressed so a hung cleanup (the hang-cleanup dead-man scenario) resolves
+    # in seconds; ample for the real, millisecond-scale noop-marker commands.
+    FAULTFORGE_INVOCATION_TIMEOUT_SECS=10 \
+    RUST_LOG=info
+USER agent
+# master_addr is required and supplied at run time (FAULTFORGE_MASTER_ADDR).
+CMD ["faultforge-agent"]

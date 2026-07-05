@@ -42,6 +42,7 @@ NAT and firewalls). You drive the whole fleet from the `faultforge` CLI.
 | `crates/agent`  | `faultforge-agent`  | Runs on a target host; executes fault instances with a safe, recoverable lifecycle |
 | `crates/cli`    | `faultforge`        | Operator CLI — one-shot scripting and an interactive TUI |
 | `crates/plugins/noop-marker` | `noop-marker` | Reference fault plugin (zero blast radius) |
+| `crates/e2e`    | — (tests)           | Dev-only end-to-end harness: runs the real binaries in rootless podman containers |
 
 ## Quick start
 
@@ -118,6 +119,26 @@ cargo fmt --check
 ```
 
 Please follow the coding standards in [CONVENTIONS.md](CONVENTIONS.md).
+
+### End-to-end tests (podman)
+
+`crates/e2e` runs the **real** master, agent, and CLI as separate rootless-podman
+containers and asserts the full fault lifecycle (journal replay after a real
+agent crash, master-loss self-abort, dead-man backstop, taint quarantine) through
+the operator surface and host ground truth. These scenarios are `#[ignore]` by
+default, so the command above stays green on machines without podman. To run them:
+
+```bash
+# macOS: start the VM first (Linux with rootless podman needs no VM step)
+podman machine start
+
+cargo test -p faultforge-e2e -- --ignored
+```
+
+The suite builds its container images on first run (a few minutes; cached
+afterwards). It is also wired to a **manual, non-blocking** `E2E` GitHub Actions
+workflow (`workflow_dispatch`) — it does not gate pull requests. See
+[`crates/e2e/README.md`](crates/e2e/README.md) for details.
 
 ## License
 

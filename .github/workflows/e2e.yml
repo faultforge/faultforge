@@ -1,0 +1,40 @@
+name: E2E
+
+# Manual, non-blocking end-to-end suite (spec: continuous-integration delta).
+# It builds the container images and runs the real binaries under rootless
+# podman. It is NOT a required check and does not gate pull requests or pushes —
+# the fast in-process suites in ci.yml do that. Promote to a gate later with a
+# trigger change plus a spec delta.
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: Container scenarios
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        # Reads channel (1.96) from rust-toolchain.toml; the host build is only
+        # the `faultforge` CLI (the harness builds master/agent in-container).
+
+      - name: Podman version
+        run: podman --version
+
+      - name: Run e2e scenarios
+        # The scenarios are #[ignore] by default; --ignored opts them in. On a
+        # failed scenario the harness writes each container's logs to FF_E2E_LOG_DIR.
+        env:
+          FF_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+        run: cargo test -p faultforge-e2e -- --ignored --nocapture --test-threads=2
+
+      - name: Upload container logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-container-logs
+          path: ${{ runner.temp }}/e2e-logs
+          if-no-files-found: ignore

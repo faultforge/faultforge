@@ -15,6 +15,7 @@ Cargo workspace, 6 crates:
 | `crates/agent` | `faultforge-agent` | **built (slice 2)** | Dials master with reconnect+backoff, register/heartbeat, and the **fault runtime**: executes fault instances from the on-disk catalog with a journal, safety timers, and taint quarantine |
 | `crates/cli` | `faultforge` | **built** | Operator CLI — one-shot scripting (`agents list/show/clear-taint`, `experiment run/list/show/halt`) + interactive TUI |
 | `crates/plugins/noop-marker` | `noop-marker` | **built** | Reference fault plugin: zero-blast-radius fault whose only effect is a marker file's existence. Proves the `faultforge-fault` contract with golden tests |
+| `crates/e2e` | — (tests) | **built (slice 4)** | Dev-only end-to-end harness (`faultforge-e2e`): builds container images and drives the **real** master/agent/CLI binaries as separate rootless-podman containers, asserting the fault lifecycle through the operator surface + host ground truth (`podman exec`). Never published; scenarios are `#[ignore]` so `cargo test --workspace` needs no podman |
 
 **Fault injection works end to end (`master-fault-dispatch`, slice 3).** The agent owns the full
 instance lifecycle (`agent-fault-runtime`): `RunFault`/`AbortFault`/`ClearTaint` handling, a pure
@@ -39,6 +40,18 @@ cargo build -p faultforge-proto      # build a single crate
 
 No system `protoc` needed — `crates/proto/build.rs` points `tonic-prost-build` at a vendored
 binary (`protoc-bin-vendored`).
+
+**End-to-end suite (`crates/e2e`, slice 4).** The container scenarios are `#[ignore]`, so the
+commands above run **nothing** from `crates/e2e` and need no podman. Run them explicitly with
+rootless podman (macOS: `podman machine start` first):
+
+```bash
+cargo test -p faultforge-e2e -- --ignored
+```
+
+The suite builds its images from `containers/Containerfile` on first run (cached after). A
+**manual, non-blocking** `.github/workflows/e2e.yml` (`workflow_dispatch`) runs it in CI — it
+does **not** gate PRs; `ci.yml` remains the required check.
 
 ### Running the binaries
 
