@@ -219,8 +219,8 @@ Durable storage (likely SQLite) is deferred.
 
 ### 18. v1 fault catalog: `kill-process` + network faults done right; resource-exhaustion carries a known risk
 
-v1 ships a **small, vetted catalog** with concrete agent-death-survivable recovery (decision 6):
-`kill-process` and network faults (`tc`/`iptables` latency, loss). **Resource-exhaustion faults
+v1 is intended to ship a **small, vetted catalog** with concrete agent-death-survivable recovery
+(decision 6): `kill-process` and network faults (`tc`/`iptables` latency, loss). **Resource-exhaustion faults
 (cpu / memory / disk)** remain in the architecture but carry a real hazard: they can starve the
 very agent that must abort them, undermining the recovery guarantee. v1 mitigation is **agent OS
 priority protection** (`nice` / `oom_score_adj`) as a cheap partial guard; **full cgroup v2

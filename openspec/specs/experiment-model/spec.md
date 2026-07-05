@@ -15,8 +15,9 @@
 
 ## Purpose
 
-Defines how the master turns single-host fault execution into a fleet-wide, safety-bounded,
-*judged* experiment (v1 scope): definition, tag-based targeting, a write control surface,
+Describes the eventual full model for how the master will turn single-host fault execution into a
+fleet-wide, safety-bounded, *judged* experiment (the planned v1 scope / design target — not yet
+built; see the status banner above): definition, tag-based targeting, a write control surface,
 single-salvo orchestration, three-role metric evaluation with the hypothesis judged during
 injection, all-or-nothing semantics, the outcome lattice, dry-run, and blast radius. Governing
 decisions: [ADR-0002](../../../docs/adr/0002-fault-model-decisions.md). Builds on
