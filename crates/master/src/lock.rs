@@ -9,8 +9,11 @@ use std::sync::{Mutex, MutexGuard};
 /// # Panics
 ///
 /// Panics if the lock is poisoned.
+#[track_caller]
 #[allow(clippy::expect_used)]
 // mutex poison means a previous thread panicked; propagating is correct
 pub(crate) fn lock_poison_free<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().expect("lock poisoned")
+    mutex
+        .lock()
+        .expect("mutex poisoned: a previous holder panicked while holding this lock; propagating the panic is the correct fail-fast response")
 }
