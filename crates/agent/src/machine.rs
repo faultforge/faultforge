@@ -345,12 +345,18 @@ fn step_preflight(which: Phase, stop: Option<StopCause>, event: Event) -> (State
             };
             aborted_with(format!("{phase_name} preflight: {}", describe(disposition)))
         }
-        Event::InvocationFailed { reason, .. } | Event::InvokeRejected { reason, .. } => {
-            aborted_with(format!("preflight invocation failed: {reason}"))
+        Event::InvocationFailed {
+            command: PluginCommand::Preflight,
+            reason,
         }
-        // Out-of-band events — a stray non-`Preflight` command, setup, or
-        // journal — cannot advance preflight: a confused shell must never
-        // crash an instance (issue #24). Absorb them, preserving `stop`.
+        | Event::InvokeRejected {
+            command: PluginCommand::Preflight,
+            reason,
+        } => aborted_with(format!("preflight invocation failed: {reason}")),
+        // Out-of-band events — a stray non-`Preflight` command's finish or
+        // failure, setup, or journal — cannot advance preflight: a confused
+        // shell must never crash an instance (issue #24). Absorb them,
+        // preserving `stop`.
         _ => (rebuild(stop), vec![]),
     }
 }
@@ -809,6 +815,50 @@ mod tests {
                 after_effects, before_effects,
                 "stray command must emit no new effects in {phase:?} preflight"
             );
+        }
+    }
+
+    #[test]
+    fn preflight_ignores_out_of_band_invocation_failure() {
+        // A failure or rejection of a non-`Preflight` command during preflight
+        // is an out-of-band signal: only the active preflight command failing
+        // may abort (issue #24). The instance must stay in preflight.
+        for phase in [Phase::Install, Phase::Runtime] {
+            let (base_events, expected_state) = match phase {
+                Phase::Install => (vec![Event::SetupOk], State::PreflightInstall { stop: None }),
+                Phase::Runtime => (
+                    vec![
+                        Event::SetupOk,
+                        finished(PluginCommand::Preflight, Disposition::Success),
+                    ],
+                    State::PreflightRuntime { stop: None },
+                ),
+            };
+            let (before_state, before_effects) = drive(base_events.clone());
+            assert_eq!(before_state, expected_state);
+
+            for stray in [
+                Event::InvocationFailed {
+                    command: PluginCommand::Cleanup,
+                    reason: "timeout".to_string(),
+                },
+                Event::InvokeRejected {
+                    command: PluginCommand::Cleanup,
+                    reason: "digest mismatch".to_string(),
+                },
+            ] {
+                let mut events = base_events.clone();
+                events.push(stray.clone());
+                let (after_state, after_effects) = drive(events);
+                assert_eq!(
+                    after_state, expected_state,
+                    "stray {stray:?} must leave {phase:?} preflight unchanged"
+                );
+                assert_eq!(
+                    after_effects, before_effects,
+                    "stray {stray:?} must emit no new effects in {phase:?} preflight"
+                );
+            }
         }
     }
 
