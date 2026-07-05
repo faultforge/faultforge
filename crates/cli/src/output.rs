@@ -12,10 +12,6 @@ use crate::cli::OutputFormat;
 /// Render a list of agents in the chosen format.
 ///
 /// `now` is used to compute relative ages for table output; it is ignored for JSON.
-///
-/// # Errors
-///
-/// Returns an error if JSON serialisation fails (should be infallible for well-typed data).
 pub fn render_agents(agents: &[Agent], format: &OutputFormat, now: SystemTime) -> String {
     match format {
         OutputFormat::Json => render_agents_json(agents),
@@ -24,10 +20,6 @@ pub fn render_agents(agents: &[Agent], format: &OutputFormat, now: SystemTime) -
 }
 
 /// Render a single agent in the chosen format.
-///
-/// # Errors
-///
-/// Returns an error if JSON serialisation fails.
 pub fn render_agent(agent: &Agent, format: &OutputFormat, now: SystemTime) -> String {
     match format {
         OutputFormat::Json => render_agent_json(agent),
