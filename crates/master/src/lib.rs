@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod dispatch;
 pub mod experiment;
+mod lock;
 pub mod management;
 pub mod registry;
 mod server;

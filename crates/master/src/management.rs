@@ -25,6 +25,7 @@ use crate::experiment::{
     Cause, Experiment, ExperimentDefinition, ExperimentId, ExperimentOutcome, ExperimentPhase,
     InstanceRecord,
 };
+use crate::lock::lock_poison_free;
 use crate::registry::{AgentInfo, Registry};
 
 // ===== Agent views =====
@@ -196,12 +197,7 @@ pub struct ManagementState {
 /// `GET /agents` — list every registered agent as a JSON array (empty when none).
 #[allow(clippy::needless_pass_by_value)] // axum requires extractors taken by value
 async fn list_agents(State(state): State<ManagementState>) -> Json<Vec<AgentView>> {
-    #[allow(clippy::expect_used)]
-    // mutex poison means a previous thread panicked; propagating is correct
-    let views = state
-        .registry
-        .lock()
-        .expect("registry lock poisoned")
+    let views = lock_poison_free(&state.registry)
         .values()
         .map(agent_view)
         .collect();
@@ -218,12 +214,7 @@ async fn get_agent(
     Path(hostname): Path<String>,
 ) -> Result<Json<AgentView>, StatusCode> {
     let hostname = Hostname::parse(&hostname).map_err(|_| StatusCode::NOT_FOUND)?;
-    #[allow(clippy::expect_used)]
-    // mutex poison means a previous thread panicked; propagating is correct
-    let view = state
-        .registry
-        .lock()
-        .expect("registry lock poisoned")
+    let view = lock_poison_free(&state.registry)
         .get(&hostname)
         .map(agent_view);
     view.map(Json).ok_or(StatusCode::NOT_FOUND)

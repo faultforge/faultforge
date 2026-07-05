@@ -13,6 +13,8 @@ use tonic::Status;
 use faultforge_proto::Hostname;
 use faultforge_proto::v1::ServerMessage;
 
+use crate::lock::lock_poison_free;
+
 /// The outbound half of one agent's `Session` stream.
 pub type SessionTx = mpsc::Sender<Result<ServerMessage, Status>>;
 
@@ -35,12 +37,7 @@ impl SessionMap {
     /// Panics if the map mutex is poisoned.
     pub fn insert(&self, hostname: &Hostname, tx: SessionTx) -> u64 {
         let epoch = self.epochs.fetch_add(1, Ordering::Relaxed);
-        #[allow(clippy::expect_used)]
-        // mutex poison means a previous thread panicked; propagating is correct
-        self.inner
-            .lock()
-            .expect("session map lock poisoned")
-            .insert(hostname.clone(), (epoch, tx));
+        lock_poison_free(&self.inner).insert(hostname.clone(), (epoch, tx));
         epoch
     }
 
@@ -51,9 +48,7 @@ impl SessionMap {
     ///
     /// Panics if the map mutex is poisoned.
     pub fn remove_if_current(&self, hostname: &Hostname, epoch: u64) {
-        #[allow(clippy::expect_used)]
-        // mutex poison means a previous thread panicked; propagating is correct
-        let mut inner = self.inner.lock().expect("session map lock poisoned");
+        let mut inner = lock_poison_free(&self.inner);
         if inner.get(hostname).is_some_and(|(e, _)| *e == epoch) {
             inner.remove(hostname);
         }
@@ -66,11 +61,7 @@ impl SessionMap {
     /// Panics if the map mutex is poisoned.
     #[must_use]
     pub fn sender(&self, hostname: &Hostname) -> Option<SessionTx> {
-        #[allow(clippy::expect_used)]
-        // mutex poison means a previous thread panicked; propagating is correct
-        self.inner
-            .lock()
-            .expect("session map lock poisoned")
+        lock_poison_free(&self.inner)
             .get(hostname)
             .map(|(_, tx)| tx.clone())
     }
@@ -82,12 +73,7 @@ impl SessionMap {
     /// Panics if the map mutex is poisoned.
     #[must_use]
     pub fn is_connected(&self, hostname: &Hostname) -> bool {
-        #[allow(clippy::expect_used)]
-        // mutex poison means a previous thread panicked; propagating is correct
-        self.inner
-            .lock()
-            .expect("session map lock poisoned")
-            .contains_key(hostname)
+        lock_poison_free(&self.inner).contains_key(hostname)
     }
 }
 
