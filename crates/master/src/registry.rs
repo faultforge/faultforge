@@ -4,6 +4,8 @@ use std::time::SystemTime;
 
 use faultforge_proto::Hostname;
 
+use crate::lock::lock_poison_free;
+
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
     pub hostname: Hostname,
@@ -27,9 +29,7 @@ pub fn new_registry() -> Registry {
 ///
 /// Panics if the registry mutex is poisoned.
 pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime) {
-    #[allow(clippy::expect_used)]
-    // mutex poison means a previous thread panicked; propagating is correct
-    let mut reg = registry.lock().expect("registry lock poisoned");
+    let mut reg = lock_poison_free(registry);
     // Re-registration must not read as "clean" before the agent's own
     // TaintStatus arrives moments later — carry the last known quarantine over.
     let tainted = reg.get(hostname).is_some_and(|info| info.tainted);
@@ -50,13 +50,7 @@ pub fn register_agent(registry: &Registry, hostname: &Hostname, now: SystemTime)
 ///
 /// Panics if the registry mutex is poisoned.
 pub fn set_taint(registry: &Registry, hostname: &Hostname, tainted: bool) {
-    #[allow(clippy::expect_used)]
-    // mutex poison means a previous thread panicked; propagating is correct
-    if let Some(entry) = registry
-        .lock()
-        .expect("registry lock poisoned")
-        .get_mut(hostname)
-    {
+    if let Some(entry) = lock_poison_free(registry).get_mut(hostname) {
         entry.tainted = tainted;
     }
 }
@@ -69,13 +63,7 @@ pub fn set_taint(registry: &Registry, hostname: &Hostname, tainted: bool) {
 ///
 /// Panics if the registry mutex is poisoned.
 pub fn update_heartbeat(registry: &Registry, hostname: &Hostname, now: SystemTime) {
-    #[allow(clippy::expect_used)]
-    // mutex poison means a previous thread panicked; propagating is correct
-    if let Some(entry) = registry
-        .lock()
-        .expect("registry lock poisoned")
-        .get_mut(hostname)
-    {
+    if let Some(entry) = lock_poison_free(registry).get_mut(hostname) {
         entry.last_seen = now;
     }
 }
