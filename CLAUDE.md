@@ -5,7 +5,7 @@ Chaos-engineering platform for **bare-metal** hosts: a central **master** (contr
 
 ## Current state
 
-Cargo workspace, 6 crates:
+Cargo workspace, 7 crates:
 
 | Crate | Bin | Status | Role |
 |-------|-----|--------|------|
@@ -15,6 +15,7 @@ Cargo workspace, 6 crates:
 | `crates/agent` | `faultforge-agent` | **built (slice 2)** | Dials master with reconnect+backoff, register/heartbeat, and the **fault runtime**: executes fault instances from the on-disk catalog with a journal, safety timers, and taint quarantine |
 | `crates/cli` | `faultforge` | **built** | Operator CLI — one-shot scripting (`agents list/show/clear-taint`, `experiment run/list/show/halt`) + interactive TUI |
 | `crates/plugins/noop-marker` | `noop-marker` | **built** | Reference fault plugin: zero-blast-radius fault whose only effect is a marker file's existence. Proves the `faultforge-fault` contract with golden tests |
+| `crates/plugins/disk-fill` | `disk-fill` | **built** | First real (host-mutating) fault plugin: consumes free space by allocating `<fill_dir>/faultforge-<instance_id>.fill` — `fallocate(2)`, chunked-write fallback, `st_blocks`-verified so a sparse fill fails loudly. Hard headroom guarantee: refuses unless `size + max(5% capacity, 64 MiB)` stays free; warns (not refuses) on tmpfs, which fills RAM, not disk |
 | `crates/e2e` | — (tests) | **built (slice 4)** | Dev-only end-to-end harness (`faultforge-e2e`): builds container images and drives the **real** master/agent/CLI binaries as separate rootless-podman containers, asserting the fault lifecycle through the operator surface + host ground truth (`podman exec`). Never published; scenarios are `#[ignore]` so `cargo test --workspace` needs no podman |
 
 **Fault injection works end to end (`master-fault-dispatch`, slice 3).** The agent owns the full
