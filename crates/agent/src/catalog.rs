@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use faultforge_fault::catalog::{CatalogError, load_plugin, plugin_dir_name};
 use faultforge_fault::digest::Digest;
-use faultforge_fault::manifest::{Manifest, PluginName, PluginNameError};
+use faultforge_fault::manifest::{Manifest, PluginName, PluginNameError, is_valid_plugin_version};
 
 /// Why a plugin could not be resolved and verified from the catalog.
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +17,9 @@ pub enum ResolveError {
     /// The wire `plugin_name` is not a valid catalog name.
     #[error("invalid plugin name: {0}")]
     Name(#[from] PluginNameError),
+    /// The wire `plugin_version` is not path-safe (charset `[A-Za-z0-9._+-]`).
+    #[error("invalid plugin version: {0}")]
+    Version(String),
     /// No catalog entry directory exists for `<name>@<version>`.
     #[error("plugin not in catalog: {0}")]
     NotFound(String),
@@ -58,6 +61,13 @@ pub fn resolve_verified(
     expected: &Digest,
 ) -> Result<VerifiedPlugin, ResolveError> {
     let name = PluginName::parse(name)?;
+    // SEC-2: the on-disk manifest charset is enforced at load time, but the wire
+    // `plugin_version` reaches `plugin_dir_name` unvalidated — a rogue master
+    // could send `1/../../../../tmp/evil` to escape `plugin_root`. Reject it with
+    // the manifest's own predicate before any filesystem join.
+    if !is_valid_plugin_version(version) {
+        return Err(ResolveError::Version(version.to_owned()));
+    }
     let dir = plugin_root.join(plugin_dir_name(&name, version));
     if !dir.is_dir() {
         return Err(ResolveError::NotFound(dir.display().to_string()));
@@ -138,6 +148,19 @@ mod tests {
         assert!(matches!(
             resolve_verified(root.path(), "fixture", "1", &digest),
             Err(ResolveError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn traversal_version_is_rejected_before_filesystem_join() {
+        let root = tempfile::tempdir().unwrap();
+        // A valid entry is installed so the version gate must be what rejects the
+        // request — not a missing directory (SEC-2: a rogue master's
+        // `plugin_version` climbing out of the catalog must never reach the join).
+        let digest = install(root.path());
+        assert!(matches!(
+            resolve_verified(root.path(), "fixture", "1/../../../../tmp/evil", &digest),
+            Err(ResolveError::Version(_))
         ));
     }
 
