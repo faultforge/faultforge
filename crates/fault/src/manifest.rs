@@ -112,6 +112,23 @@ pub enum ManifestError {
     ZeroDuration,
 }
 
+/// Returns whether `version` is a path-safe plugin version: every byte is in
+/// the charset `[A-Za-z0-9._+-]`.
+///
+/// `<name>@<version>` feeds the catalog directory name (`plugin_dir_name`), so a
+/// path separator or other unsafe character would let the identity escape the
+/// catalog root. This is the single source of truth for the version charset:
+/// [`Manifest::validate`] enforces it on the on-disk manifest, and the agent
+/// enforces the same rule on the wire `plugin_version` (SEC-2) before any
+/// filesystem join. Note that an empty string satisfies this predicate; callers
+/// that require a non-empty version must check that separately.
+#[must_use]
+pub fn is_valid_plugin_version(version: &str) -> bool {
+    version
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+}
+
 /// The raw, shape-only manifest as deserialized from YAML, before semantic
 /// validation. Private so the only way to obtain a public [`Manifest`] from YAML
 /// is [`Manifest::parse`], which validates — deserializing cannot bypass the
@@ -201,11 +218,7 @@ impl Manifest {
         if self.version.is_empty() {
             return Err(ManifestError::VersionEmpty);
         }
-        if !self
-            .version
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
-        {
+        if !is_valid_plugin_version(&self.version) {
             return Err(ManifestError::VersionInvalidChar(self.version.clone()));
         }
         if self.max_duration_secs == 0 {

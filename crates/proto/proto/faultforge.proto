@@ -12,8 +12,9 @@ message AgentMessage {
   oneof payload {
     Register register = 1;
     Heartbeat heartbeat = 2;
-    // Fault telemetry (wire schema only in implement-fault-schema; the agent does
-    // not yet emit these — behaviour arrives in agent-fault-runtime).
+    // Fault telemetry, all emitted by the agent since agent-fault-runtime.
+    // InstanceStatus is the sole authoritative lifecycle track; FaultEvent is
+    // log-only (per-message contracts below).
     FaultEvent fault_event = 3;
     InstanceStatus instance_status = 4;
     InstanceReport instance_report = 5;

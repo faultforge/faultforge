@@ -21,6 +21,7 @@ use crate::experiment::{
     Cause, DEADLINE_MARGIN_MS, Experiment, ExperimentDefinition, ExperimentId, ExperimentPhase,
     HostFacts, ValidationFailure, mint_experiment, validate,
 };
+use crate::lock::lock_poison_free;
 use crate::registry::{Registry, set_taint};
 use crate::sessions::SessionMap;
 
@@ -108,9 +109,7 @@ impl Dispatcher {
     }
 
     fn lock_store(&self) -> std::sync::MutexGuard<'_, HashMap<ExperimentId, Experiment>> {
-        #[allow(clippy::expect_used)]
-        // mutex poison means a previous thread panicked; propagating is correct
-        self.store.lock().expect("experiment store lock poisoned")
+        lock_poison_free(&self.store)
     }
 
     // ===== Accept path (design D5, single salvo) =====
@@ -150,9 +149,7 @@ impl Dispatcher {
     }
 
     fn gather_host_facts(&self, definition: &ExperimentDefinition) -> HashMap<String, HostFacts> {
-        #[allow(clippy::expect_used)]
-        // mutex poison means a previous thread panicked; propagating is correct
-        let registry = self.registry.lock().expect("registry lock poisoned");
+        let registry = lock_poison_free(&self.registry);
         let mut facts = HashMap::new();
         for action in &definition.actions {
             for host in &action.hosts {
@@ -401,9 +398,7 @@ impl Dispatcher {
     /// Panics if the registry mutex is poisoned.
     pub async fn clear_taint(&self, hostname: &Hostname) -> ClearTaintOutcome {
         {
-            #[allow(clippy::expect_used)]
-            // mutex poison means a previous thread panicked; propagating is correct
-            let registry = self.registry.lock().expect("registry lock poisoned");
+            let registry = lock_poison_free(&self.registry);
             if !registry.contains_key(hostname) {
                 return ClearTaintOutcome::UnknownHost;
             }
