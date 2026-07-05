@@ -75,13 +75,7 @@ pub fn invoke(
         Err(e) => return failed(format!("could not encode plugin input: {e}")),
     };
 
-    let mut child = match Command::new(entrypoint)
-        .arg(command.as_str())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let mut child = match spawn_entrypoint(entrypoint, command) {
         Ok(child) => child,
         Err(e) => return failed(format!("spawn failed: {e}")),
     };
@@ -107,6 +101,36 @@ pub fn invoke(
         lines: split_stdout(&stdout),
         stderr,
         outcome: status,
+    }
+}
+
+/// `execve` returns `ETXTBSY` when the entrypoint is still open for writing in
+/// some process. Under a parallel test runner (and, more rarely, when a plugin
+/// was just installed) this is a transient fork/exec race — another thread's
+/// write fd was copied into our forked child between `fork` and `exec` — so we
+/// retry a few times before giving up. See the flaky-CI diagnosis for
+/// `malformed_lines_are_split_out_not_fatal`.
+const SPAWN_RETRIES: u32 = 5;
+const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+/// `errno` for `ETXTBSY`; stable across Linux ABIs, the agent's only target.
+const ETXTBSY: i32 = 26;
+
+fn spawn_entrypoint(entrypoint: &Path, command: PluginCommand) -> std::io::Result<Child> {
+    let mut attempt = 0;
+    loop {
+        match Command::new(entrypoint)
+            .arg(command.as_str())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < SPAWN_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(SPAWN_RETRY_BACKOFF);
+            }
+            other => return other,
+        }
     }
 }
 
