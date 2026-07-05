@@ -25,25 +25,12 @@ use model::{Effect, Model, Msg};
 /// Polling interval between automatic agent refreshes.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// A handle to the crossterm key-reader thread.
-///
-/// The thread reads blocking key events and sends them through a channel.
-/// The handle joins the thread on drop.
-struct KeyReaderHandle(Option<std::thread::JoinHandle<()>>);
-
-impl Drop for KeyReaderHandle {
-    fn drop(&mut self) {
-        // The thread exits when the sender channel is closed (event loop dropped
-        // the receiver), so we just detach here to avoid a join block on exit.
-        if let Some(handle) = self.0.take() {
-            drop(handle);
-        }
-    }
-}
-
 /// Spawn a thread that reads crossterm events and sends key presses into `tx`.
-fn spawn_key_reader(tx: mpsc::UnboundedSender<Msg>) -> KeyReaderHandle {
-    let handle = std::thread::spawn(move || {
+///
+/// The returned handle is detached on drop; the thread exits on its own when
+/// the channel closes (the event loop dropped the receiver).
+fn spawn_key_reader(tx: mpsc::UnboundedSender<Msg>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
         loop {
             match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -56,8 +43,7 @@ fn spawn_key_reader(tx: mpsc::UnboundedSender<Msg>) -> KeyReaderHandle {
                 Err(_) => break,
             }
         }
-    });
-    KeyReaderHandle(Some(handle))
+    })
 }
 
 /// Launch the interactive TUI.

@@ -15,7 +15,7 @@ use super::model::{Effect, Model, Msg};
 #[must_use]
 pub fn update(mut model: Model, msg: Msg, now: SystemTime) -> (Model, Option<Effect>) {
     match msg {
-        Msg::Key(key) => handle_key(model, key, now),
+        Msg::Key(key) => handle_key(model, key),
         Msg::Tick => {
             // Skip the periodic fetch if one is already in flight, so a slow or
             // hung master cannot pile up overlapping requests. A manual `r`
@@ -47,11 +47,7 @@ pub fn update(mut model: Model, msg: Msg, now: SystemTime) -> (Model, Option<Eff
     }
 }
 
-fn handle_key(
-    mut model: Model,
-    key: crossterm::event::KeyEvent,
-    now: SystemTime,
-) -> (Model, Option<Effect>) {
+fn handle_key(mut model: Model, key: crossterm::event::KeyEvent) -> (Model, Option<Effect>) {
     use KeyCode::{Char, Down, Up};
 
     if matches!(key.code, Char('q'))
@@ -73,7 +69,6 @@ fn handle_key(
         model.selected -= 1;
     }
 
-    let _ = now; // now is not used in key handling but kept for signature consistency
     (model, None)
 }
 

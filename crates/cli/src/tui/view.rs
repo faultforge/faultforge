@@ -1,6 +1,6 @@
 //! Pure TUI view: build all four layout regions from the model.
 //!
-//! No I/O — `view` returns a closure that ratatui can render.
+//! No I/O — `view` renders directly into the frame ratatui provides.
 
 use std::time::SystemTime;
 
