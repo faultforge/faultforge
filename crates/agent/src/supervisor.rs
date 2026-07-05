@@ -612,7 +612,13 @@ async fn run_instance(
     };
     let (env, initial_event) = match setup_result {
         Ok(Ok((_plugin, params))) => (InstanceEnv { params, ..env }, Event::SetupOk),
-        Ok(Err(reason)) => (env, Event::SetupFailed { reason }),
+        Ok(Err(reason)) => {
+            // The reason also rides the Error `InstanceStatus` to the master, but a
+            // local log makes a rejected RunFault visible on the host even with the
+            // master link down — notably a SEC-2 version rejection before any join.
+            warn!(instance_id = %env.id, reason = ?reason, "setup rejected RunFault");
+            (env, Event::SetupFailed { reason })
+        }
         Err(join_err) => (
             env,
             Event::SetupFailed {
