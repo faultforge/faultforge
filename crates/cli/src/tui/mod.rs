@@ -27,8 +27,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Spawn a thread that reads crossterm events and sends key presses into `tx`.
 ///
-/// The returned handle is detached on drop; the thread exits on its own when
-/// the channel closes (the event loop dropped the receiver).
+/// The returned handle is detached on drop. The thread blocks in
+/// `event::read()`, so it does not observe a closed channel immediately: it
+/// stops only once `event::read()` errors, or once the next key event arrives
+/// and the follow-up `tx.send(...)` fails because the event loop dropped the
+/// receiver. Until then it can linger past the receiver.
 fn spawn_key_reader(tx: mpsc::UnboundedSender<Msg>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
