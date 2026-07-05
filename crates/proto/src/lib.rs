@@ -32,31 +32,78 @@ pub fn unix_ms(t: SystemTime) -> i64 {
     ms
 }
 
+/// Maximum total length of a hostname, per RFC 1123 / RFC 1035.
+const MAX_HOSTNAME_LEN: usize = 253;
+/// Maximum length of a single dot-separated label, per RFC 1123.
+const MAX_LABEL_LEN: usize = 63;
+
 /// Error type returned by [`Hostname::parse`].
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum HostnameError {
     /// The supplied string was empty or contained only whitespace.
     #[error("hostname must not be empty")]
     Empty,
+    /// The supplied string exceeded [`MAX_HOSTNAME_LEN`] characters.
+    // Carries only the length, never the input: this is the log-injection
+    // guard (SEC-6), so the offending bytes must never reach a log line.
+    #[error("hostname must be at most 253 characters, got {0}")]
+    TooLong(usize),
+    /// A dot-separated label violated the RFC 1123 label rules.
+    // Debug-formatted (`{0:?}`) so control characters in the offending label
+    // are escaped rather than emitted raw — the SEC-6 log-injection guard.
+    #[error(
+        "hostname label {0:?} is invalid: each label must be 1-63 characters \
+         of [A-Za-z0-9-] with no leading or trailing hyphen"
+    )]
+    InvalidLabel(String),
 }
 
-/// Validated, non-empty hostname.
+/// Validated hostname: RFC 1123 charset and length, non-empty.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hostname(String);
 
+/// Validate a single dot-separated hostname label against RFC 1123.
+fn validate_label(label: &str) -> Result<(), HostnameError> {
+    let ok = (1..=MAX_LABEL_LEN).contains(&label.len())
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(HostnameError::InvalidLabel(label.to_string()))
+    }
+}
+
 impl Hostname {
-    /// Parse and validate a hostname string.
+    /// Parse and validate a hostname string (surrounding whitespace is trimmed).
+    ///
+    /// Enforces RFC-1123 DNS-name rules: total length 1..=253, one or more
+    /// dot-separated labels each 1..=63 characters drawn from `[A-Za-z0-9-]`
+    /// with no leading or trailing hyphen. This bounds identity keys and keeps
+    /// control characters out of logs (SEC-6).
     ///
     /// # Errors
     ///
-    /// Returns [`HostnameError::Empty`] if the string is empty or contains only whitespace.
+    /// - [`HostnameError::Empty`] if the string is empty or only whitespace.
+    /// - [`HostnameError::TooLong`] if it exceeds 253 characters.
+    /// - [`HostnameError::InvalidLabel`] if any label is empty, over 63
+    ///   characters, contains a character outside `[A-Za-z0-9-]` (including
+    ///   control characters), or has a leading/trailing hyphen.
     pub fn parse(s: &str) -> Result<Self, HostnameError> {
         let s = s.trim();
         if s.is_empty() {
-            Err(HostnameError::Empty)
-        } else {
-            Ok(Self(s.to_string()))
+            return Err(HostnameError::Empty);
         }
+        if s.len() > MAX_HOSTNAME_LEN {
+            return Err(HostnameError::TooLong(s.len()));
+        }
+        for label in s.split('.') {
+            validate_label(label)?;
+        }
+        Ok(Self(s.to_string()))
     }
 
     #[must_use]
@@ -77,7 +124,7 @@ mod tests {
         AgentMessage, Heartbeat, HeartbeatAck, Register, RegisterAck, ServerMessage, agent_message,
         server_message,
     };
-    use super::{Hostname, unix_ms};
+    use super::{Hostname, HostnameError, MAX_HOSTNAME_LEN, unix_ms};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -175,5 +222,86 @@ mod tests {
     fn hostname_trims_whitespace() {
         let h = Hostname::parse("  web-01  ").expect("valid hostname with surrounding whitespace");
         assert_eq!(h.as_str(), "web-01");
+    }
+
+    #[test]
+    fn hostname_fqdn_is_ok() {
+        let h = Hostname::parse("web-01.prod.example.com").expect("valid FQDN");
+        assert_eq!(h.as_str(), "web-01.prod.example.com");
+    }
+
+    #[test]
+    fn hostname_control_char_is_rejected() {
+        assert_eq!(
+            Hostname::parse("web\n01"),
+            Err(HostnameError::InvalidLabel("web\n01".to_string()))
+        );
+        assert!(Hostname::parse("web\t01").is_err());
+        assert!(Hostname::parse("web\x01").is_err());
+    }
+
+    #[test]
+    fn hostname_over_length_is_rejected() {
+        let long = "a".repeat(300);
+        assert_eq!(Hostname::parse(&long), Err(HostnameError::TooLong(300)));
+    }
+
+    #[test]
+    fn hostname_length_boundary() {
+        // 253 = 3 labels of 63 chars + a 61-char label + 3 dots.
+        let at_cap = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(at_cap.len(), MAX_HOSTNAME_LEN);
+        assert!(Hostname::parse(&at_cap).is_ok());
+
+        let over_cap = format!("{at_cap}e");
+        assert_eq!(over_cap.len(), MAX_HOSTNAME_LEN + 1);
+        assert!(matches!(
+            Hostname::parse(&over_cap),
+            Err(HostnameError::TooLong(_))
+        ));
+    }
+
+    #[test]
+    fn hostname_label_over_63_is_rejected() {
+        let label = "a".repeat(64);
+        assert_eq!(
+            Hostname::parse(&label),
+            Err(HostnameError::InvalidLabel(label))
+        );
+    }
+
+    #[test]
+    fn hostname_leading_or_trailing_hyphen_is_rejected() {
+        assert!(matches!(
+            Hostname::parse("-web"),
+            Err(HostnameError::InvalidLabel(_))
+        ));
+        assert!(matches!(
+            Hostname::parse("web-"),
+            Err(HostnameError::InvalidLabel(_))
+        ));
+    }
+
+    #[test]
+    fn hostname_leading_or_trailing_dot_is_rejected() {
+        // A leading/trailing/doubled dot yields an empty label.
+        assert_eq!(
+            Hostname::parse(".web"),
+            Err(HostnameError::InvalidLabel(String::new()))
+        );
+        assert!(matches!(
+            Hostname::parse("web."),
+            Err(HostnameError::InvalidLabel(_))
+        ));
+        assert!(matches!(
+            Hostname::parse("web..prod"),
+            Err(HostnameError::InvalidLabel(_))
+        ));
     }
 }
