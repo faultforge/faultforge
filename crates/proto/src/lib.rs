@@ -43,16 +43,16 @@ pub enum HostnameError {
     /// The supplied string was empty or contained only whitespace.
     #[error("hostname must not be empty")]
     Empty,
-    /// The supplied string exceeded [`MAX_HOSTNAME_LEN`] characters.
+    /// The supplied string exceeded [`MAX_HOSTNAME_LEN`] bytes.
     // Carries only the length, never the input: this is the log-injection
     // guard (SEC-6), so the offending bytes must never reach a log line.
-    #[error("hostname must be at most 253 characters, got {0}")]
+    #[error("hostname must be at most 253 bytes, got {0}")]
     TooLong(usize),
     /// A dot-separated label violated the RFC 1123 label rules.
     // Debug-formatted (`{0:?}`) so control characters in the offending label
     // are escaped rather than emitted raw — the SEC-6 log-injection guard.
     #[error(
-        "hostname label {0:?} is invalid: each label must be 1-63 characters \
+        "hostname label {0:?} is invalid: each label must be 1-63 bytes \
          of [A-Za-z0-9-] with no leading or trailing hyphen"
     )]
     InvalidLabel(String),
@@ -80,17 +80,19 @@ fn validate_label(label: &str) -> Result<(), HostnameError> {
 impl Hostname {
     /// Parse and validate a hostname string (surrounding whitespace is trimmed).
     ///
-    /// Enforces RFC-1123 DNS-name rules: total length 1..=253, one or more
-    /// dot-separated labels each 1..=63 characters drawn from `[A-Za-z0-9-]`
-    /// with no leading or trailing hyphen. This bounds identity keys and keeps
-    /// control characters out of logs (SEC-6).
+    /// Enforces RFC-1123 DNS-name rules: total length 1..=253 bytes, one or
+    /// more dot-separated labels each 1..=63 bytes drawn from `[A-Za-z0-9-]`
+    /// with no leading or trailing hyphen. Lengths are measured in bytes, but
+    /// the `[A-Za-z0-9-]` charset is ASCII-only, so every accepted hostname has
+    /// one byte per character. This bounds identity keys and keeps control
+    /// characters out of logs (SEC-6).
     ///
     /// # Errors
     ///
     /// - [`HostnameError::Empty`] if the string is empty or only whitespace.
-    /// - [`HostnameError::TooLong`] if it exceeds 253 characters.
+    /// - [`HostnameError::TooLong`] if it exceeds 253 bytes.
     /// - [`HostnameError::InvalidLabel`] if any label is empty, over 63
-    ///   characters, contains a character outside `[A-Za-z0-9-]` (including
+    ///   bytes, contains a character outside `[A-Za-z0-9-]` (including
     ///   control characters), or has a leading/trailing hyphen.
     pub fn parse(s: &str) -> Result<Self, HostnameError> {
         let s = s.trim();
