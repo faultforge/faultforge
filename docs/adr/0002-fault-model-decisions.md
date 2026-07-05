@@ -178,6 +178,13 @@ breach must **persist** is a separate `sustain` field. The master polls at a con
 `sampling_interval`. A connector unreachable beyond tolerance is **fail-safe**: treated as a
 guardrail breach (abort), never as "in range".
 
+> **Implementation status: DEFERRED — not built.** The shipped `experiment-lite`
+> (`master-fault-dispatch`, slice 3) has no metric rules and no connectors, so none of the three
+> roles (precondition / guardrail / hypothesis) exist. Its kill-switch fires only on
+> agent-authoritative signals (an instance reaching `ERROR`, an unrequested abort, an in-scope
+> taint) or an operator halt — never on a metric breach. Because there is no hypothesis, the
+> outcome lattice collapses `RESILIENT` / `WEAKNESS_FOUND` into `COMPLETED` (see §15 below).
+
 ### 15. The experiment outcome separates "ran cleanly" from "hypothesis verdict"
 
 - `RESILIENT` — ran and cleaned up cleanly, hypothesis held. 🟢
@@ -198,6 +205,11 @@ computed against **currently-live** hosts — a percentage over a registry that 
 agents is a lie. This couples blast radius to a **heartbeat staleness sweep**, which today does not
 exist; see "known gaps".
 
+> **Implementation status: DEFERRED — not built.** `experiment-lite` targets hosts by explicit
+> hostname and fires a single salvo; it declares and enforces no blast-radius ceiling. The
+> heartbeat staleness sweep this decision depends on still does not exist, so there is no
+> live-host denominator to compute a ceiling against.
+
 ### 17. Master experiment state is in-memory now, database-backed later
 
 A master restart mid-experiment loses the experiment record while faults may be live on agents.
@@ -207,13 +219,19 @@ Durable storage (likely SQLite) is deferred.
 
 ### 18. v1 fault catalog: `kill-process` + network faults done right; resource-exhaustion carries a known risk
 
-v1 ships a **small, vetted catalog** with concrete agent-death-survivable recovery (decision 6):
-`kill-process` and network faults (`tc`/`iptables` latency, loss). **Resource-exhaustion faults
+v1 is intended to ship a **small, vetted catalog** with concrete agent-death-survivable recovery
+(decision 6): `kill-process` and network faults (`tc`/`iptables` latency, loss). **Resource-exhaustion faults
 (cpu / memory / disk)** remain in the architecture but carry a real hazard: they can starve the
 very agent that must abort them, undermining the recovery guarantee. v1 mitigation is **agent OS
 priority protection** (`nice` / `oom_score_adj`) as a cheap partial guard; **full cgroup v2
 confinement** of fault instances is deferred to v2. Until confinement lands, resource-exhaustion
 faults are "use with eyes open", not "prod-ready" in the same sense as the core catalog.
+
+> **Implementation status: DEFERRED — no catalog fault built yet.** None of the vetted catalog
+> (`kill-process`, `tc`/`iptables` network faults, resource-exhaustion) exists yet. The only
+> shipped plugin is `noop-marker` (`crates/plugins/noop-marker`): a zero-blast-radius reference
+> fault that proves the `faultforge-fault` contract and the end-to-end lifecycle. The OS priority
+> protection described here is likewise not yet wired up.
 
 ---
 
