@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use faultforge_fault::proto::from_wire_i32;
 use faultforge_proto::Hostname;
@@ -158,7 +158,9 @@ impl Session {
             Ok(reply) => {
                 if let Some(h) = self.hostname.as_ref() {
                     update_heartbeat(self.dispatcher.registry(), h, now);
-                    info!(hostname = %h, "heartbeat");
+                    // debug, not info: at fleet scale (200 agents) the per-heartbeat
+                    // line floods default-level logs with ~40 lines/sec of noise.
+                    debug!(hostname = %h, "heartbeat");
                 }
                 self.send(reply).await
             }
