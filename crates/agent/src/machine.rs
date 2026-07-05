@@ -315,8 +315,8 @@ fn step_preflight(which: Phase, stop: Option<StopCause>, event: Event) -> (State
     match event {
         Event::StopRequested { cause } => (rebuild(stop.or(Some(cause))), vec![]),
         Event::CommandFinished {
+            command: PluginCommand::Preflight,
             disposition: Disposition::Success,
-            ..
         } => {
             if let Some(cause) = stop {
                 return aborted_with(format!("{}; never injected", cause.reason()));
@@ -335,7 +335,10 @@ fn step_preflight(which: Phase, stop: Option<StopCause>, event: Event) -> (State
                 ),
             }
         }
-        Event::CommandFinished { disposition, .. } => {
+        Event::CommandFinished {
+            command: PluginCommand::Preflight,
+            disposition,
+        } => {
             let phase_name = match which {
                 Phase::Install => "install",
                 Phase::Runtime => "runtime",
@@ -345,7 +348,9 @@ fn step_preflight(which: Phase, stop: Option<StopCause>, event: Event) -> (State
         Event::InvocationFailed { reason, .. } | Event::InvokeRejected { reason, .. } => {
             aborted_with(format!("preflight invocation failed: {reason}"))
         }
-        // Setup and journal events cannot occur here; ignore defensively.
+        // Out-of-band events — a stray non-`Preflight` command, setup, or
+        // journal — cannot advance preflight: a confused shell must never
+        // crash an instance (issue #24). Absorb them, preserving `stop`.
         _ => (rebuild(stop), vec![]),
     }
 }
@@ -774,6 +779,37 @@ mod tests {
             finished(PluginCommand::Preflight, Disposition::Unexpected(1)),
         ]);
         assert_eq!(state, State::Aborted);
+    }
+
+    #[test]
+    fn preflight_ignores_out_of_band_command() {
+        // A confused shell must never crash an instance: a finished command
+        // other than `Preflight` during preflight is ignored, not acted on.
+        for phase in [Phase::Install, Phase::Runtime] {
+            let (mut events, expected_state) = match phase {
+                Phase::Install => (vec![Event::SetupOk], State::PreflightInstall { stop: None }),
+                Phase::Runtime => (
+                    vec![
+                        Event::SetupOk,
+                        finished(PluginCommand::Preflight, Disposition::Success),
+                    ],
+                    State::PreflightRuntime { stop: None },
+                ),
+            };
+            let (before_state, before_effects) = drive(events.clone());
+            assert_eq!(before_state, expected_state);
+
+            events.push(finished(PluginCommand::Cleanup, Disposition::Success));
+            let (after_state, after_effects) = drive(events);
+            assert_eq!(
+                after_state, expected_state,
+                "stray command must leave {phase:?} preflight unchanged"
+            );
+            assert_eq!(
+                after_effects, before_effects,
+                "stray command must emit no new effects in {phase:?} preflight"
+            );
+        }
     }
 
     #[test]
