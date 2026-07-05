@@ -1,0 +1,10 @@
+name: hang-cleanup
+version: "1"
+entrypoint: ./hang-cleanup.sh
+params_schema:
+  marker_path: string
+requires:
+  binaries: []
+  privileges: []
+  preconditions: []
+max_duration_secs: 600

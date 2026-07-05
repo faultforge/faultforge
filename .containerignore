@@ -1,0 +1,4 @@
+# Keep the (potentially multi-GB) build output and git history out of the build
+# context — the builder stage recompiles from source inside the container.
+target
+.git

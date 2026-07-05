@@ -1,0 +1,20 @@
+[package]
+name = "faultforge-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Dev-only harness: drives the real binaries in podman containers. Never published.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The harness talks to the management plane for fine-grained polling. Blocking
+# client so scenarios stay plain synchronous `#[test]`s (no tokio runtime).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "blocking"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
