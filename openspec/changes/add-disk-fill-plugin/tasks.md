@@ -62,7 +62,7 @@
 ## 5. Docs & bookkeeping
 
 - [x] 5.1 Update `CLAUDE.md` crate table with `crates/plugins/disk-fill`
-- [ ] 5.2 Reference issue #62 in the PR; note the known limitations (no root-fs opt-in guard
+- [x] 5.2 Reference issue #62 in the PR; note the known limitations (no root-fs opt-in guard
       pending #85; fallback write loop vs the 60s invocation timeout; best-effort headroom on
       CoW filesystems — btrfs RAID-profile `statvfs` fuzziness, ZFS pool-level accounting and
       missing `fallocate`)
