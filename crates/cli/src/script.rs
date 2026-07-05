@@ -4,7 +4,7 @@
 //! subcommand, renders the result, and maps outcomes to exit codes.
 //! All decision logic (rendering, error mapping) lives in the pure modules.
 
-use std::io::Write as _;
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -50,16 +50,14 @@ async fn run_agents(client: &Client, global: &GlobalArgs, sub: &AgentsCommand) -
         AgentsCommand::List => match client.list_agents().await {
             Ok(agents) => {
                 let out = output::render_agents(&agents, &global.output, now);
-                println!("{out}");
-                EXIT_OK
+                emit(&out)
             }
             Err(e) => write_transport_error(&e),
         },
         AgentsCommand::Show { hostname } => match client.get_agent(hostname).await {
             Ok(agent) => {
                 let out = output::render_agent(&agent, &global.output, now);
-                println!("{out}");
-                EXIT_OK
+                emit(&out)
             }
             Err(ApiError::NotFound) => {
                 eprintln!("error: agent not found: {hostname}");
@@ -68,15 +66,12 @@ async fn run_agents(client: &Client, global: &GlobalArgs, sub: &AgentsCommand) -
             Err(e) => write_transport_error(&e),
         },
         AgentsCommand::ClearTaint { hostname } => match client.clear_taint(hostname).await {
-            Ok(()) => {
-                print_action(
-                    &global.output,
-                    "clear-taint requested",
-                    hostname,
-                    "the agent confirms via its next report; verify with `agents show`",
-                );
-                EXIT_OK
-            }
+            Ok(()) => print_action(
+                &global.output,
+                "clear-taint requested",
+                hostname,
+                "the agent confirms via its next report; verify with `agents show`",
+            ),
             Err(ApiError::NotFound) => {
                 eprintln!("error: agent not found: {hostname}");
                 EXIT_NOT_FOUND
@@ -96,16 +91,14 @@ async fn run_experiment(client: &Client, global: &GlobalArgs, sub: &ExperimentCo
         ExperimentCommand::List => match client.list_experiments().await {
             Ok(experiments) => {
                 let out = output::render_experiments(&experiments, &global.output, now);
-                println!("{out}");
-                EXIT_OK
+                emit(&out)
             }
             Err(e) => write_transport_error(&e),
         },
         ExperimentCommand::Show { id } => match client.get_experiment(id).await {
             Ok(experiment) => {
                 let out = output::render_experiment(&experiment, &global.output, now);
-                println!("{out}");
-                EXIT_OK
+                emit(&out)
             }
             Err(ApiError::NotFound) => {
                 eprintln!("error: experiment not found: {id}");
@@ -114,10 +107,7 @@ async fn run_experiment(client: &Client, global: &GlobalArgs, sub: &ExperimentCo
             Err(e) => write_transport_error(&e),
         },
         ExperimentCommand::Halt { id } => match client.halt_experiment(id).await {
-            Ok(()) => {
-                print_action(&global.output, "halt requested", id, "kill-switch fired");
-                EXIT_OK
-            }
+            Ok(()) => print_action(&global.output, "halt requested", id, "kill-switch fired"),
             Err(ApiError::NotFound) => {
                 eprintln!("error: experiment not found: {id}");
                 EXIT_NOT_FOUND
@@ -147,8 +137,7 @@ async fn run_experiment_file(client: &Client, global: &GlobalArgs, file: &Path, 
 
     if !wait {
         let out = output::render_experiment(&experiment, &global.output, SystemTime::now());
-        println!("{out}");
-        return EXIT_OK;
+        return emit(&out);
     }
 
     // --wait: print only the final record so stdout stays one JSON document.
@@ -157,7 +146,10 @@ async fn run_experiment_file(client: &Client, global: &GlobalArgs, file: &Path, 
         Err(e) => return write_transport_error(&e),
     };
     let out = output::render_experiment(&final_record, &global.output, SystemTime::now());
-    println!("{out}");
+    // A closed pipe here trumps the outcome code: report the contract exit, not the outcome.
+    if let Err(code) = write_line(&mut std::io::stdout().lock(), &out) {
+        return code;
+    }
     outcome_exit_code(final_record.outcome.as_deref())
 }
 
@@ -196,14 +188,39 @@ fn outcome_exit_code(outcome: Option<&str>) -> i32 {
 }
 
 /// Report an accepted action on stdout: a small JSON object for scripting, a
-/// sentence for humans.
-fn print_action(format: &OutputFormat, action: &str, subject: &str, note: &str) {
-    match format {
+/// sentence for humans. Returns the exit code (see [`emit`]).
+fn print_action(format: &OutputFormat, action: &str, subject: &str, note: &str) -> i32 {
+    let line = match format {
         OutputFormat::Json => {
-            let body = serde_json::json!({"status": action, "subject": subject, "note": note});
-            println!("{body}");
+            serde_json::json!({"status": action, "subject": subject, "note": note}).to_string()
         }
-        OutputFormat::Table => println!("{action}: {subject} ({note})"),
+        OutputFormat::Table => format!("{action}: {subject} ({note})"),
+    };
+    emit(&line)
+}
+
+/// Write `line` (plus a newline) to a locked stdout, returning the exit code.
+///
+/// Thin shell over [`write_line`] for the common case where a successful write
+/// means [`EXIT_OK`].
+fn emit(line: &str) -> i32 {
+    match write_line(&mut std::io::stdout().lock(), line) {
+        Ok(()) => EXIT_OK,
+        Err(code) => code,
+    }
+}
+
+/// Write `line` followed by a newline to `w`, mapping the outcome to an exit code.
+///
+/// A closed downstream reader (`… | head`) surfaces as [`std::io::ErrorKind::BrokenPipe`];
+/// that is the normal end of a pipeline, so it maps to a silent [`EXIT_OK`] instead of the
+/// panic `println!` raises (issue #22 — the exit-code contract must survive a closed pipe).
+/// Any other write failure maps to [`EXIT_ERROR`].
+fn write_line(w: &mut impl Write, line: &str) -> Result<(), i32> {
+    match writeln!(w, "{line}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(EXIT_OK),
+        Err(_) => Err(EXIT_ERROR),
     }
 }
 
@@ -221,6 +238,36 @@ fn write_transport_error(e: &ApiError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AlwaysFails(std::io::ErrorKind);
+
+    impl Write for AlwaysFails {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(self.0))
+        }
+    }
+
+    #[test]
+    fn write_line_appends_newline_on_success() {
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(write_line(&mut buf, "hello"), Ok(()));
+        assert_eq!(buf, b"hello\n");
+    }
+
+    #[test]
+    fn write_line_maps_broken_pipe_to_ok_not_panic() {
+        let mut sink = AlwaysFails(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(write_line(&mut sink, "anything"), Err(EXIT_OK));
+    }
+
+    #[test]
+    fn write_line_maps_other_io_errors_to_error_exit() {
+        let mut sink = AlwaysFails(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(write_line(&mut sink, "anything"), Err(EXIT_ERROR));
+    }
 
     #[test]
     fn outcome_exit_codes_are_distinct() {
