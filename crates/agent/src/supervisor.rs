@@ -616,7 +616,7 @@ async fn run_instance(
             // The reason also rides the Error `InstanceStatus` to the master, but a
             // local log makes a rejected RunFault visible on the host even with the
             // master link down — notably a SEC-2 version rejection before any join.
-            warn!(instance_id = %env.id, reason = %reason, "setup rejected RunFault");
+            warn!(instance_id = %env.id, reason = ?reason, "setup rejected RunFault");
             (env, Event::SetupFailed { reason })
         }
         Err(join_err) => (

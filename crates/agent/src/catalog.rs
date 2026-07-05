@@ -18,7 +18,7 @@ pub enum ResolveError {
     #[error("invalid plugin name: {0}")]
     Name(#[from] PluginNameError),
     /// The wire `plugin_version` is not path-safe (charset `[A-Za-z0-9._+-]`).
-    #[error("invalid plugin version: {0}")]
+    #[error("invalid plugin version: {0:?}")]
     Version(String),
     /// No catalog entry directory exists for `<name>@<version>`.
     #[error("plugin not in catalog: {0}")]
