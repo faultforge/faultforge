@@ -1,0 +1,21 @@
+[package]
+name = "disk-fill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "disk-fill"
+path = "src/main.rs"
+
+[dependencies]
+faultforge-fault = { path = "../../fault" }
+serde_json = { workspace = true }
+humantime = { workspace = true }
+# tempfile_in: the un-leakable preflight writability probe (O_TMPFILE on Linux,
+# create+immediate-unlink elsewhere). Also serves the golden tests (tempdir).
+tempfile = { workspace = true }
+rustix = { workspace = true }
+
+[lints]
+workspace = true

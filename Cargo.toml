@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [ "crates/agent", "crates/cli", "crates/e2e", "crates/fault", "crates/master", "crates/plugins/noop-marker", "crates/proto"]
+members = [ "crates/agent", "crates/cli", "crates/e2e", "crates/fault", "crates/master", "crates/plugins/disk-fill", "crates/plugins/noop-marker", "crates/proto"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,6 +36,8 @@ humantime = "2"
 # Runtime dep of noop-marker (preflight writability probe + atomic marker write)
 # and a dev-dep for catalog/plugin tests.
 tempfile = "3"
+# disk-fill's syscall surface (fallocate/statvfs/statfs) without unsafe blocks.
+rustix = { version = "1", features = ["fs"] }
 axum = "0.8"
 hostname = "0.4"
 thiserror = "2"

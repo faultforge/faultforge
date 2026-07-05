@@ -159,6 +159,39 @@ fn agent_tainted(topo: &Topology) -> bool {
         .unwrap_or(false)
 }
 
+// ===== disk-fill helpers =====
+
+/// Experiment YAML for the disk-fill plugin, filling under the agent's data
+/// volume (guaranteed to exist and be agent-writable).
+fn disk_fill_yaml(name: &str, host: &str, size_mib: u64, duration_secs: u32) -> String {
+    format!(
+        "name: {name}\n\
+         actions:\n\
+         \x20 - hosts: [{host}]\n\
+         \x20   plugin: {{name: disk-fill, version: \"1\"}}\n\
+         \x20   params: {{fill_dir: {AGENT_DATA_DIR}, size_mib: {size_mib}}}\n\
+         \x20   duration_secs: {duration_secs}\n"
+    )
+}
+
+/// The deterministic fill-file path disk-fill derives for the single action of
+/// experiment `id` on `host` (`instance_id = <id>:<host>:0`).
+fn fill_file(id: &str, host: &str) -> String {
+    format!("{AGENT_DATA_DIR}/faultforge-{id}:{host}:0.fill")
+}
+
+/// `stat` the fill file inside the agent container: `(bytes, 512-blocks)`.
+fn agent_stat(topo: &Topology, path: &str) -> (u64, u64) {
+    let out = topo.agent_exec("0", &["stat", "-c", "%s %b", path]);
+    let mut parts = out.stdout.split_whitespace();
+    let size = parts.next().and_then(|s| s.parse().ok());
+    let blocks = parts.next().and_then(|s| s.parse().ok());
+    match (size, blocks) {
+        (Some(size), Some(blocks)) => (size, blocks),
+        _ => panic!("unparseable stat output for {path}: {:?}", out.stdout),
+    }
+}
+
 // ===== Scenario 3.1: happy path =====
 
 #[test]
@@ -401,4 +434,157 @@ fn taint_blocks_experiments_until_cleared() {
         "post-clear record:\n{}",
         run.stdout
     );
+}
+
+// ===== disk-fill: the first real host-mutating fault =====
+
+#[test]
+#[ignore = "requires rootless podman; run with -- --ignored"]
+fn disk_fill_happy_path_fills_exactly_and_cleans_up() {
+    let topo = Topology::start("dfhappy");
+    let size_mib: u64 = 16;
+    let yaml = disk_fill_yaml("df-happy-e2e", topo.agent_hostname(), size_mib, 5);
+    let yaml_path = write_yaml("dfhappy", &yaml);
+
+    // Drive `--wait` off-thread so the main thread can stat the fill file while
+    // the instance is ACTIVE. --wait's exit code is part of the test.
+    let url = topo.management_url().to_string();
+    let file_arg = yaml_path.to_string_lossy().into_owned();
+    let cli = std::thread::spawn(move || {
+        topology::run_cli(&url, &["experiment", "run", "-f", &file_arg, "--wait"])
+    });
+
+    let id = wait_for_experiment_id(&topo);
+    wait_for_instance_state(&topo, &id, "ACTIVE");
+    let fill = fill_file(&id, topo.agent_hostname());
+    assert!(
+        topo.agent_path_exists(&fill),
+        "fill file must exist while ACTIVE"
+    );
+    let (bytes, blocks) = agent_stat(&topo, &fill);
+    let size = size_mib * 1024 * 1024;
+    assert_eq!(bytes, size, "fill file has exactly the requested length");
+    assert!(
+        blocks * 512 >= size,
+        "fill must be backed by blocks ({} of {size} bytes)",
+        blocks * 512
+    );
+
+    let result = cli.join().expect("CLI thread panicked");
+    assert_eq!(
+        result.code, 0,
+        "expected exit 0, stderr:\n{}",
+        result.stderr
+    );
+    assert_eq!(
+        result.json().get("outcome").and_then(Value::as_str),
+        Some("COMPLETED"),
+        "CLI final record:\n{}",
+        result.stdout
+    );
+
+    assert!(
+        !topo.agent_path_exists(&fill),
+        "fill file must be removed after COMPLETED"
+    );
+    assert!(topo.journal_is_empty(), "journal empty after COMPLETED");
+}
+
+#[test]
+#[ignore = "requires rootless podman; run with -- --ignored"]
+fn disk_fill_halt_aborts_and_removes_the_fill() {
+    let topo = Topology::start("dfhalt");
+    // Long duration so the halt lands squarely mid-ACTIVE.
+    let yaml = disk_fill_yaml("df-halt-e2e", topo.agent_hostname(), 16, 30);
+    let yaml_path = write_yaml("dfhalt", &yaml);
+    let res = topo.cli(&["experiment", "run", "-f", &yaml_path.to_string_lossy()]);
+    assert_eq!(res.code, 0, "experiment rejected, stderr:\n{}", res.stderr);
+    let id = res
+        .json()
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("accepted experiment has an id")
+        .to_string();
+    wait_for_instance_state(&topo, &id, "ACTIVE");
+    let fill = fill_file(&id, topo.agent_hostname());
+    assert!(topo.agent_path_exists(&fill), "fill present while ACTIVE");
+
+    let halt = topo.cli(&["experiment", "halt", &id]);
+    assert_eq!(halt.code, 0, "halt rejected, stderr:\n{}", halt.stderr);
+
+    assert_eq!(wait_for_outcome(&topo, &id), "ABORTED");
+    assert!(!topo.agent_path_exists(&fill), "fill removed after halt");
+    assert!(topo.journal_is_empty(), "journal empty after halt");
+}
+
+#[test]
+#[ignore = "requires rootless podman; run with -- --ignored"]
+fn disk_fill_preflight_refusal_leaves_host_untouched() {
+    let topo = Topology::start("dfrefuse");
+    // Exbibyte-scale: no container filesystem satisfies size + headroom, so the
+    // runtime preflight refuses (exit 10 → ABORTED before inject).
+    let yaml = disk_fill_yaml("df-refuse-e2e", topo.agent_hostname(), 1 << 40, 5);
+    let yaml_path = write_yaml("dfrefuse", &yaml);
+    let run = topo.cli(&[
+        "experiment",
+        "run",
+        "-f",
+        &yaml_path.to_string_lossy(),
+        "--wait",
+    ]);
+    assert_eq!(
+        run.code, 4,
+        "a refused preflight must end the waited experiment ABORTED, stderr:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        run.json().get("outcome").and_then(Value::as_str),
+        Some("ABORTED"),
+        "CLI final record:\n{}",
+        run.stdout
+    );
+
+    let id = wait_for_experiment_id(&topo);
+    let fill = fill_file(&id, topo.agent_hostname());
+    assert!(
+        !topo.agent_path_exists(&fill),
+        "the fill file must never have been created"
+    );
+    assert!(
+        topo.journal_is_empty(),
+        "nothing was injected, journal empty"
+    );
+}
+
+#[test]
+#[ignore = "requires rootless podman; run with -- --ignored"]
+fn disk_fill_crash_replay_removes_the_fill() {
+    let topo = Topology::start("dfcrash");
+    let yaml = disk_fill_yaml("df-crash-e2e", topo.agent_hostname(), 16, 30);
+    let yaml_path = write_yaml("dfcrash", &yaml);
+    let res = topo.cli(&["experiment", "run", "-f", &yaml_path.to_string_lossy()]);
+    assert_eq!(res.code, 0, "experiment rejected, stderr:\n{}", res.stderr);
+    let id = res
+        .json()
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("accepted experiment has an id")
+        .to_string();
+    wait_for_instance_state(&topo, &id, "ACTIVE");
+    let fill = fill_file(&id, topo.agent_hostname());
+    assert!(topo.agent_path_exists(&fill), "fill present while ACTIVE");
+    assert!(!topo.journal_is_empty(), "journal has the live instance");
+
+    // A real crash: kill the process, restart the same container on the same
+    // data volume so restart replay (abort+cleanup) reverts the real fill.
+    topo.agent_kill();
+    topo.agent_restart();
+    topo.wait_for_registration();
+
+    assert_eq!(wait_for_outcome(&topo, &id), "ABORTED");
+    assert!(
+        !topo.agent_path_exists(&fill),
+        "replay removed the fill file"
+    );
+    assert!(topo.journal_is_empty(), "replay removed the journal entry");
 }

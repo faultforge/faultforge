@@ -9,13 +9,15 @@ FROM docker.io/library/rust:1.96-bookworm AS builder
 WORKDIR /src
 # .containerignore keeps target/ and .git out of the context.
 COPY . .
-RUN cargo build --release -p faultforge-master -p faultforge-agent -p noop-marker
+RUN cargo build --release -p faultforge-master -p faultforge-agent -p noop-marker -p disk-fill
 
 # Assemble the on-disk catalog: <name>@<version>/{manifest.yaml, entrypoint}.
 RUN set -eux; \
-    mkdir -p /catalog/noop-marker@1 /catalog/hang-cleanup@1; \
+    mkdir -p /catalog/noop-marker@1 /catalog/disk-fill@1 /catalog/hang-cleanup@1; \
     cp crates/plugins/noop-marker/manifest.yaml   /catalog/noop-marker@1/manifest.yaml; \
     cp target/release/noop-marker                 /catalog/noop-marker@1/noop-marker; \
+    cp crates/plugins/disk-fill/manifest.yaml     /catalog/disk-fill@1/manifest.yaml; \
+    cp target/release/disk-fill                   /catalog/disk-fill@1/disk-fill; \
     cp containers/hang-cleanup/manifest.yaml      /catalog/hang-cleanup@1/manifest.yaml; \
     cp containers/hang-cleanup/hang-cleanup.sh    /catalog/hang-cleanup@1/hang-cleanup.sh; \
     chmod +x /catalog/hang-cleanup@1/hang-cleanup.sh

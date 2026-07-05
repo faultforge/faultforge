@@ -1,0 +1,20 @@
+# disk-fill: consume free space on a filesystem by allocating one file at
+# <fill_dir>/faultforge-<instance_id>.fill (fallocate; chunked-write fallback on
+# filesystems without fallocate — large fills there may hit the agent's
+# invocation timeout). Preflight refuses unless free space covers
+# size_mib + max(5% of capacity, 64 MiB): the fault can never fill a filesystem
+# to 100%, and the headroom is deliberately not a parameter. On CoW filesystems
+# (btrfs/ZFS) the free-space check is best effort. Filling a tmpfs consumes
+# memory, not disk; preflight warns but allows it.
+name: disk-fill
+version: "1"
+entrypoint: ./disk-fill
+params_schema:
+  fill_dir: string
+  size_mib: int
+requires:
+  binaries: []
+  privileges: []
+  preconditions:
+    - fill_dir_writable
+max_duration_secs: 3600
