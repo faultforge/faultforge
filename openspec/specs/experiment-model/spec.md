@@ -1,5 +1,18 @@
 # Spec: Experiment Model
 
+> **Status: FUTURE WORK — the full model below is not built.** What ships today is a reduced
+> **experiment-lite** subset (`master-fault-dispatch`, slice 3): explicit-hostname targeting (no
+> tags), a single salvo, and the write control surface (launch / watch / halt with the global
+> kill-switch). It has **no** metric rules or connectors, so none of the three metric roles
+> (precondition / guardrail / hypothesis), no dry-run, and no blast radius; the lifecycle is
+> collapsed (there is no DRAFT→…→VERDICT progression). The outcome lattice is reduced to
+> `COMPLETED` / `ABORTED` / `ERROR` (`ERROR` dominates, per ADR-0002 §13) — `RESILIENT` /
+> `WEAKNESS_FOUND` collapse into `COMPLETED` precisely because there is no hypothesis to judge.
+> The remainder of this document (tag targeting, metric rules, guardrails, hypotheses,
+> `RESILIENT` / `WEAKNESS_FOUND`, dry-run, blast radius) describes the eventual full experiment
+> model and is retained as the design target. See `CLAUDE.md` ("Current state") and
+> [ADR-0002](../../../docs/adr/0002-fault-model-decisions.md) for the shipped scope.
+
 ## Purpose
 
 Defines how the master turns single-host fault execution into a fleet-wide, safety-bounded,
